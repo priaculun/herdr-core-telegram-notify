@@ -29,6 +29,11 @@ at `f15304d`; the entries below are what this fork adds on top.
   `BLOCKED_MIN_DURATION_SECONDS` is the only way to give a blocked agent a
   floor, and blocked still inherits none by default: a quota that ran out looks
   exactly like a long turn.
+- A blocked nudge that Telegram refused is owed again on the next pass, rather
+  than written off as sent. Marking the stretch as nudged before the send meant
+  one failure (a flaky network, a 403) silenced that agent for as long as it
+  stood there, because with `BLOCKED_REPEAT_MINUTES` off nothing else ever owed
+  a message about it. A delivered nudge is recorded once Telegram has taken it.
 - `BLOCKED_IGNORE_QUIET_HOURS` delivers blocked messages during quiet hours
   (still silently). Off by default.
 - `sweepIntervalMs` in the new `policy.mjs` decides the sweeper interval from
