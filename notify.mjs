@@ -369,11 +369,11 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       // return and never be announced.
       const key = file.replace(/^state-|\.json$/g, "");
       const fresh = readState(stateDir, key);
-      if (!fresh.status || fresh.status === "blocked") {
-        // The current file wins over this pass's snapshot, so a start time that
-        // moved during the send is the one kept.
-        writeState(stateDir, key, { ...(fresh.status ? fresh : state), remindedAt: Date.now() });
-      }
+      // Only a stretch that is still blocked is marked. The current file wins
+      // over this pass's snapshot, so a start time that moved during the send is
+      // the one kept; a file that is gone or has moved on is left alone rather
+      // than recreated, which would resurrect a stretch that already ended.
+      if (fresh.status === "blocked") writeState(stateDir, key, { ...fresh, remindedAt: Date.now() });
       sent += 1;
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
