@@ -7,10 +7,11 @@
 // turn that is thinking), so `blocked` never inherits a duration meant to quiet
 // short `done` turns. It can be given one of its own, and nothing else.
 
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 
-import { DEFAULTS, STATUSES, inQuietHours, isOn, parseQuietHours, toInt } from "./lib.mjs";
+import { DEFAULTS, STATUSES, holdFlock, inQuietHours, isOn, parseQuietHours, toInt } from "./lib.mjs";
 
 // The order a summary lists them in, which is the order they matter in to
 // someone reading it on a phone: the two that notify by default first.
@@ -60,8 +61,8 @@ export function policySilent(cfg, status) {
 // once, an hour ago" into "it is still stuck".
 export function reminderTiming(cfg) {
   return {
-    firstMs: toInt(cfg("BLOCKED_REMINDER_MINUTES"), 0) * 60 * 1000,
-    repeatMs: toInt(cfg("BLOCKED_REPEAT_MINUTES"), 0) * 60 * 1000,
+    firstMs: minutesMs(cfg("BLOCKED_REMINDER_MINUTES")),
+    repeatMs: minutesMs(cfg("BLOCKED_REPEAT_MINUTES")),
   };
 }
 
@@ -72,28 +73,45 @@ export function reminderDue(state, cfg, now = Date.now()) {
   const { firstMs, repeatMs } = reminderTiming(cfg);
   if (state?.status !== "blocked" || !state.paneId) return undefined;
   if (!state.remindedAt) {
-    // Without a first-nudge delay the transition message is the notification;
-    // repeating it a minute later would only teach you to ignore both.
-    if (!firstMs || now - state.updatedAt < firstMs) return undefined;
-    return "first";
+    // The stretch has not been nudged about yet, so the next message is either
+    // the first nudge or — with no first-nudge delay configured — the first
+    // repeat. A repeat measured from nothing would never fire, which is why it
+    // is measured from when the stretch began.
+    const from = firstMs || repeatMs;
+    if (!from || now - state.updatedAt < from) return undefined;
+    return firstMs ? "first" : "repeat";
   }
   if (!repeatMs || now - state.remindedAt < repeatMs) return undefined;
   return "repeat";
 }
 
-// How often the sweeper has to wake. A repeat shorter than SWEEP_MINUTES would
-// arrive late by however much the sweeper oversleeps, so the shorter of the two
-// wins. 0 means nothing needs sweeping: no queue timer, and no repeat to keep
-// time for.
+// How often the sweeper has to wake. A reminder shorter than SWEEP_MINUTES
+// would arrive late by however much the sweeper oversleeps, so the shortest of
+// the three wins. 0 means nothing needs sweeping: no queue timer, and no
+// reminder to keep time for.
 //
-// BLOCKED_REMINDER_MINUTES is deliberately not consulted. The first nudge is
-// owed by a pane that stopped changing status, and every event already sweeps —
-// starting a timer for it would put a second sweep in flight at the moment a
-// hook is trying to send, which is a lock to lose a message to, not a nudge to
-// gain. A repeat has no event to ride on, so it does need the timer.
+// A blocked stretch that stops changing status is exactly the case no further
+// event arrives for, so both reminders need a clock of their own. Sweeping is
+// serialised by SWEEP_RUN_LOCK, so a timer that fires while a hook is sending
+// finds the lock taken and leaves it to that send rather than sending twice.
 const SWEEP_FLOOR_MS = 30 * 1000;
+// Node clamps a delay above this to 1ms, which turns a sleepy sweeper into a
+// spinning one: the value has to be refused rather than passed to setTimeout.
+const MAX_TIMER_MS = 2_147_483_647;
+
+// A whole number of minutes from the config, in ms, bounded so it can be slept
+// on. Anything past the timer limit is capped there rather than overflowing —
+// "every 40 years" and "every 68 years" are the same setting to anyone reading
+// it on a phone.
+function minutesMs(value) {
+  const minutes = toInt(value, 0);
+  if (!minutes) return 0;
+  return Math.min(minutes * 60 * 1000, MAX_TIMER_MS);
+}
+
 export function sweepIntervalMs(cfg) {
-  const intervals = [toInt(cfg("SWEEP_MINUTES"), 0) * 60 * 1000, reminderTiming(cfg).repeatMs].filter((ms) => ms > 0);
+  const { firstMs, repeatMs } = reminderTiming(cfg);
+  const intervals = [minutesMs(cfg("SWEEP_MINUTES")), firstMs, repeatMs].filter((ms) => ms > 0);
   if (!intervals.length) return 0;
   return Math.max(SWEEP_FLOOR_MS, Math.min(...intervals));
 }
@@ -104,7 +122,15 @@ export function sweepIntervalMs(cfg) {
 // which is what "custom from the phone" has to mean; the token and chat id are
 // deliberately not among them — a chat that can rewrite the credential it is
 // authenticated by is one bad message away from being locked out.
-export const EDITABLE_KEYS = Object.keys(DEFAULTS);
+// MUTE_MINUTES is not in DEFAULTS (it lives in EXTRA_KEYS) but it is a
+// notification setting like any other: it is what a bare /mute uses, so leaving
+// it out would make the one setting a phone user reaches for most the one they
+// have to go back to a shell for.
+export const EDITABLE_KEYS = [...Object.keys(DEFAULTS), "MUTE_MINUTES"];
+
+// A week. Past this the setting is not a schedule but a typo, and the timer it
+// would configure is one Node clamps into a spin.
+const MAX_TIMER_MINUTES = 10080;
 
 const BOOLEAN_KEYS = new Set([
   "SHOW_TITLE", "SHOW_PROMPT", "SHOW_PROJECT", "SHOW_BRANCH", "SHOW_CHANGES", "SHOW_DURATION",
@@ -125,9 +151,9 @@ const NUMBER_KEYS = new Map([
   ["MIN_DURATION_SECONDS", { min: 0 }],
   ...STATUSES.map((status) => [STATUS_MIN_DURATION_KEYS[status], { min: 0 }]),
   ["BLOCKED_DELAY_SECONDS", { min: 0, max: 120 }],
-  ["BLOCKED_REMINDER_MINUTES", { min: 0 }],
-  ["BLOCKED_REPEAT_MINUTES", { min: 0 }],
-  ["SWEEP_MINUTES", { min: 0 }],
+  ["BLOCKED_REMINDER_MINUTES", { min: 0, max: MAX_TIMER_MINUTES }],
+  ["BLOCKED_REPEAT_MINUTES", { min: 0, max: MAX_TIMER_MINUTES }],
+  ["SWEEP_MINUTES", { min: 0, max: MAX_TIMER_MINUTES }],
 ]);
 
 // Why this value would not be read, or undefined when it would. The bot answers
@@ -187,10 +213,30 @@ function envValue(value) {
 export function writeEnvSetting(dir, key, value) {
   if (!dir) throw new Error("no config directory");
   const path = join(dir, ".env");
+  // This file holds the credentials every hook process reads, and a hook can
+  // start at any moment. Two writers must not interleave, and a reader must not
+  // see a half-written file: the rewrite is serialised by a lock and lands with
+  // one rename, so a concurrent loadConfig() reads either the old file or the
+  // new one. Without flock there is no lock — the write is still atomic, which
+  // is the part that matters for a reader.
+  const release = holdFlock(`${path}.lock`, { waitSeconds: 5 });
+  try {
+    return writeEnvLocked(path, key, value);
+  } finally {
+    release?.();
+  }
+}
+
+function writeEnvLocked(path, key, value) {
+  const dir = dirname(path);
   let text = "";
   try {
     text = readFileSync(path, "utf8");
-  } catch {}
+  } catch (err) {
+    // Anything but a missing file means the rewrite would silently drop
+    // settings that are there but unreadable.
+    if (err.code !== "ENOENT") throw err;
+  }
   const assignment = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=`);
   const rendered = value === undefined || String(value).trim() === "" ? undefined : `${key}=${envValue(value)}`;
 
@@ -214,11 +260,20 @@ export function writeEnvSetting(dir, key, value) {
   }
   const body = out.join("\n");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
+  // Written beside the file and renamed over it: rename(2) is atomic within a
+  // directory, so no reader ever sees a truncated .env, and a crash mid-write
+  // leaves the old file rather than half of a new one.
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    // writeFileSync only applies the mode to a new file.
-    if (statSync(path).mode & 0o077) chmodSync(path, 0o600);
-  } catch {}
+    writeFileSync(temp, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, path);
+  } catch (err) {
+    try {
+      unlinkSync(temp);
+    } catch {}
+    throw err;
+  }
   return path;
 }
 

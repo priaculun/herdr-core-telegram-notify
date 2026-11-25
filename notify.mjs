@@ -268,9 +268,14 @@ function overdueBlocked(stateDir, cfg) {
         continue;
       }
       const kind = reminderDue(state, cfg, now);
-      if (kind) due.push({ file: name, state, kind });
+      if (kind) due.push({ file: name, state, kind, since: state.remindedAt ?? state.updatedAt ?? 0 });
     }
   } catch {}
+  // Oldest first, because only MAX_REMINDERS are sent per pass: reading the
+  // directory in whatever order it comes back means the same few panes could
+  // take every slot while a pane behind them waits for a message that never
+  // comes. The pane waiting longest is the one that has been stuck longest.
+  due.sort((a, b) => a.since - b.since);
   return due;
 }
 
@@ -908,13 +913,18 @@ async function main() {
   // is the one that may be costing money while it waits.
   const silent = policySilent(cfg, status);
   const muted = mutedUntil(stateDir);
-  if (!paneClosed) await ensureDaemons(stateDir, cfg);
   // Whatever the network was down for waits in the state directory, and any
   // status change or pane closure is a cue to try again — even when this run
   // filters it out, which is what keeps a queue from sitting there
-  // until the next thing worth notifying happens. The sweeper above is the cue
-  // for when no status change comes at all.
+  // until the next thing worth notifying happens. The sweeper is the cue for
+  // when no status change comes at all.
+  //
+  // Swept before the daemons are started, not after: this run already holds the
+  // cue, and a sweeper started first would take the sweep lock and leave this
+  // one's own queue and reminders to a process that has not even finished
+  // booting.
   const online = await sweep(stateDir, cfg);
+  if (!paneClosed) await ensureDaemons(stateDir, cfg);
 
   const previous = readState(stateDir, key);
   if (!paneClosed && previous.status === status) {

@@ -51,7 +51,7 @@ function fakeHerdr(dir) {
   return path;
 }
 
-function fixture({ sweepMinutes, env = [] } = {}) {
+function fixture({ sweepMinutes, reminderMinutes = 1, env = [] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "sweep-test-"));
   const stateDir = join(root, "state");
   const configDir = join(root, "config");
@@ -63,7 +63,7 @@ function fixture({ sweepMinutes, env = [] } = {}) {
       "TELEGRAM_BOT_TOKEN=123456789:AAtesttesttesttesttesttesttest",
       "TELEGRAM_CHAT_ID=42",
       ...(sweepMinutes === undefined ? [] : [`SWEEP_MINUTES=${sweepMinutes}`]),
-      "BLOCKED_REMINDER_MINUTES=1",
+      `BLOCKED_REMINDER_MINUTES=${reminderMinutes}`,
       "SHOW_SCREEN_ON_BLOCKED=0",
       "SHOW_HERD=0",
       ...env,
@@ -166,9 +166,11 @@ test("the sweeper flushes the queue, keeping what each message was about, and nu
   }
 });
 
-test("nothing sweeps in the background until SWEEP_MINUTES says so", async () => {
+test("nothing sweeps in the background until a setting asks for one", async () => {
   const tg = await fakeTelegram();
-  const fx = fixture(); // the key unset, as an untouched .env has it
+  // Every timer off, as an untouched .env has it: no SWEEP_MINUTES, and no
+  // reminder that would need one.
+  const fx = fixture({ reminderMinutes: 0 });
   try {
     const hook = spawn(process.execPath, [NOTIFY], {
       env: {
@@ -194,13 +196,59 @@ test("nothing sweeps in the background until SWEEP_MINUTES says so", async () =>
   }
 });
 
-test("SWEEP_MINUTES=0 stops the sweeper", async () => {
+test("SWEEP_MINUTES=0 with no reminder stops the sweeper", async () => {
   const tg = await fakeTelegram();
-  const fx = fixture({ sweepMinutes: 0 });
+  const fx = fixture({ sweepMinutes: 0, reminderMinutes: 0 });
   try {
     const out = await runSweeper(fx, tg.base, { until: () => false, timeoutMs: 10000 });
     assert.match(out, /stopping the sweeper/);
     assert.equal(tg.sent.length, 0);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a reminder setting alone starts the sweeper, because a blocked pane stops sending events", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture({ reminderMinutes: 5 });
+  try {
+    // An event with no SWEEP_MINUTES configured: the first nudge is owed by a
+    // pane that will never change status again, so the clock has to start here
+    // rather than wait for a change that is the thing being waited on.
+    const hook = spawn(process.execPath, [NOTIFY], {
+      env: {
+        ...process.env,
+        HERDR_PLUGIN_EVENT_JSON: JSON.stringify({ data: { pane_id: "wA:p1", agent_status: "done", agent: "claude" } }),
+        HERDR_PLUGIN_CONTEXT_JSON: "{}",
+        HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+        HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+        HERDR_BIN_PATH: fx.herdr,
+        TELEGRAM_API_BASE: tg.base,
+      },
+    });
+    let out = "";
+    hook.stdout.on("data", (d) => (out += d));
+    hook.stderr.on("data", (d) => (out += d));
+    await new Promise((resolve) => hook.on("exit", resolve));
+    assert.match(out, /started the reminder sweeper/, out);
+    assert.ok(existsSync(join(fx.stateDir, "sweep.lock")), "the sweeper lock is what says one is running");
+  } finally {
+    tg.close();
+  }
+});
+
+test("with no first delay, the repeat still arrives", async () => {
+  const tg = await fakeTelegram();
+  // The reviewer's case: BLOCKED_REMINDER_MINUTES off, BLOCKED_REPEAT_MINUTES on.
+  // A stretch that was never nudged has no remindedAt, and measuring the repeat
+  // from nothing is how a configured feature stays silent for ever.
+  const fx = fixture({ reminderMinutes: 0, env: ["BLOCKED_REPEAT_MINUTES=1"] });
+  try {
+    writeFileSync(join(fx.stateDir, "state-wA_p1.json"), blocked("wA:p1", 5));
+    await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 1 });
+    const texts = tg.sent.map((m) => m.text);
+    assert.match(texts[0], /still blocked/, texts.join("\n---\n"));
+    assert.match(texts[0], /waiting 5m/);
   } finally {
     tg.close();
   }

@@ -219,7 +219,7 @@ if (!stateDir) {
     if (flockHeld(join(stateDir, "sweep.lock"))) {
       ok("sweeper", `running — ${why} are swept every ${humanDuration(sweepMs)}`);
     } else {
-      bad("sweeper", `SWEEP_MINUTES or BLOCKED_REPEAT_MINUTES asks for a sweep every ${humanDuration(sweepMs)} but nothing is sweeping; the next status change starts it`);
+      bad("sweeper", `SWEEP_MINUTES, BLOCKED_REMINDER_MINUTES or BLOCKED_REPEAT_MINUTES asks for a sweep every ${humanDuration(sweepMs)} but nothing is sweeping; the next status change starts it`);
     }
   }
 }

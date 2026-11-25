@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -80,12 +80,20 @@ test("a blocked stretch is nudged once, then repeated on its own clock", () => {
   assert.equal(reminderDue({ ...state, remindedAt: now - 31 * MINUTE }, cfg, now), "repeat");
 });
 
-test("without a first delay the transition message is the notification", () => {
+test("without a first delay the first repeat is measured from when the wait began", () => {
+  // Repeats on their own have to work: BLOCKED_REPEAT_MINUTES is the setting that
+  // reports a blocked pane that never changes status, and a stretch that was
+  // never nudged has no `remindedAt` to measure from. Measuring from nothing is
+  // how this feature can look configured and stay silent for ever.
   const cfg = conf({ BLOCKED_REMINDER_MINUTES: "0", BLOCKED_REPEAT_MINUTES: "10" });
   const now = 1000 * MINUTE;
   const state = { status: "blocked", paneId: "wA:p1", updatedAt: now - 60 * MINUTE };
-  assert.equal(reminderDue(state, cfg, now), undefined);
+  assert.equal(reminderDue(state, cfg, now), "repeat");
+  assert.equal(reminderDue({ ...state, updatedAt: now - 5 * MINUTE }, cfg, now), undefined);
+  // Once nudged, the clock is the nudge.
   assert.equal(reminderDue({ ...state, remindedAt: now - 11 * MINUTE }, cfg, now), "repeat");
+  // With neither timing set nothing repeats at all, however long it stands.
+  assert.equal(reminderDue(state, conf(), now), undefined);
 });
 
 test("a repeat needs a repeat setting, and only a blocked pane owes anything", () => {
@@ -98,19 +106,23 @@ test("a repeat needs a repeat setting, and only a blocked pane owes anything", (
   assert.equal(reminderDue({ status: "blocked", updatedAt: now - 60 * MINUTE }, cfg, now), undefined);
 });
 
-test("the sweeper wakes for the shorter of its two reasons, and not at all by default", () => {
+test("the sweeper wakes for the shortest of its three reasons, and not at all by default", () => {
   assert.equal(sweepIntervalMs(conf()), 0);
   assert.equal(sweepIntervalMs(conf({ SWEEP_MINUTES: "5" })), 5 * MINUTE);
-  // A repeat cannot wait for an event that will not come, so it starts the
-  // sweeper on its own.
+  // A reminder cannot wait for an event that will not come — a blocked pane
+  // stops changing status, which is the whole situation being reported — so
+  // either one starts the sweeper on its own.
   assert.equal(sweepIntervalMs(conf({ BLOCKED_REPEAT_MINUTES: "10" })), 10 * MINUTE);
+  assert.equal(sweepIntervalMs(conf({ BLOCKED_REMINDER_MINUTES: "5" })), 5 * MINUTE);
   assert.equal(sweepIntervalMs(conf({ SWEEP_MINUTES: "10", BLOCKED_REPEAT_MINUTES: "2" })), 2 * MINUTE);
-  // The first nudge rides on the next event instead: starting a timer for it
-  // would put a second sweep in flight while a hook is trying to send.
-  assert.equal(sweepIntervalMs(conf({ BLOCKED_REMINDER_MINUTES: "5" })), 0);
-  // A sub-minute interval is rounded up rather than turned into a spin.
+  assert.equal(sweepIntervalMs(conf({ SWEEP_MINUTES: "10", BLOCKED_REMINDER_MINUTES: "3" })), 3 * MINUTE);
+  // Never less than the floor, whatever is asked for.
   assert.equal(sweepIntervalMs(conf({ SWEEP_MINUTES: "1", BLOCKED_REPEAT_MINUTES: "0" })), MINUTE);
   assert.equal(reminderTiming(conf({ BLOCKED_REPEAT_MINUTES: "1" })).repeatMs, MINUTE);
+  // Past the point Node clamps a timer to 1ms, the value is capped rather than
+  // handed to setTimeout.
+  const huge = conf({ BLOCKED_REMINDER_MINUTES: "99999999999999999999" });
+  assert.ok(sweepIntervalMs(huge) <= 2_147_483_647);
 });
 
 test("the chat may change notification settings and not the credentials", () => {
@@ -118,6 +130,37 @@ test("the chat may change notification settings and not the credentials", () => 
   assert.ok(EDITABLE_KEYS.includes("BLOCKED_REPEAT_MINUTES"));
   assert.ok(!EDITABLE_KEYS.includes("TELEGRAM_BOT_TOKEN"));
   assert.ok(!EDITABLE_KEYS.includes("TELEGRAM_CHAT_ID"));
+  // What a bare /mute uses is a notification setting too, and one a phone user
+  // reaches for: it lives in EXTRA_KEYS, so it is named here on purpose.
+  assert.ok(EDITABLE_KEYS.includes("MUTE_MINUTES"));
+  assert.equal(validateSetting("MUTE_MINUTES", "30"), undefined);
+  assert.match(validateSetting("MUTE_MINUTES", "0"), /1 or more/);
+});
+
+test("a timer longer than Node can sleep is refused rather than handed to setTimeout", () => {
+  // Node clamps a delay above 2^31-1 ms to 1ms, which turns a sleepy sweeper
+  // into a spinning one — so the value has to be refused at write time and the
+  // interval capped at read time, in case an existing .env already holds one.
+  assert.match(validateSetting("SWEEP_MINUTES", "40000"), /capped at 10080/);
+  assert.equal(validateSetting("SWEEP_MINUTES", "10080"), undefined);
+  const absurd = conf({ BLOCKED_REPEAT_MINUTES: "99999999999999999999" });
+  assert.ok(Number.isFinite(sweepIntervalMs(absurd)));
+  assert.ok(sweepIntervalMs(absurd) <= 2_147_483_647);
+});
+
+test("a rewrite cannot leave a reader with half a file", () => {
+  // The .env holds the token every hook process reads. It is written beside
+  // itself and renamed over the original, so a reader sees the old file or the
+  // new one and never a truncated one: the temporary never survives a write,
+  // and a missing original is not an error.
+  const dir = mkdtempSync(join(tmpdir(), "policy-atomic-"));
+  const before = readdirSync(dir);
+  writeEnvSetting(dir, "DONE_MIN_DURATION_SECONDS", "30");
+  const text = readFileSync(join(dir, ".env"), "utf8");
+  assert.match(text, /^DONE_MIN_DURATION_SECONDS=30$/m);
+  assert.equal(statSync(join(dir, ".env")).mode & 0o777, 0o600);
+  const stray = readdirSync(dir).filter((name) => !before.includes(name) && !["..", ".", ".env"].includes(name));
+  assert.deepEqual(stray.filter((name) => name.startsWith(".env.") && name.endsWith(".tmp")), [], `temporary files left behind: ${stray}`);
 });
 
 test("a value is checked before it is written, and the reason says what is wrong", () => {
