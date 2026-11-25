@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+This repository is a fork of
+[`naturalmoods/herdr-telegram-notify`](https://github.com/naturalmoods/herdr-telegram-notify)
+at `f15304d`; the entries below are what this fork adds on top.
+
 - `MUTE_MINUTES` is editable from the chat like any other setting, including the
   one a bare `/mute` uses. A timer setting above a week is refused rather than
   handed to `setTimeout`, which clamps it to a millisecond and spins the sweeper.

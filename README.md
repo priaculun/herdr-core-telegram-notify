@@ -4,6 +4,13 @@ Messages you on Telegram when an agent in Herdr finishes or needs input, and
 lets you answer that agent from the chat. It runs as a plugin under Herdr TUI,
 and as a small daemon next to herdr-core for the Herdr app.
 
+> **This is a fork.** Everything below is upstream
+> [`naturalmoods/herdr-telegram-notify`](https://github.com/naturalmoods/herdr-telegram-notify)
+> (snapshot recorded in `.upstream-sha`), plus one branch of changes for a
+> deployment that has to know quickly when an agent is stuck. Upstream is the
+> place to send bug reports about anything that is not the additions listed in
+> [What this fork adds](#what-this-fork-adds). MIT, upstream's copyright kept.
+
 ## Features
 
 - [Notifications](docs/guide.md#the-message): title, prompt, changes, timing, usage and the last response from Claude Code, Codex or pi.
@@ -14,6 +21,30 @@ and as a small daemon next to herdr-core for the Herdr app.
 - [Sidebar state](docs/guide.md#sidebar-tokens): notification, phone-input and mute badges at the desk.
 - [Noise control](docs/guide.md#noise-control): quiet hours, short-turn filtering, blocked delays, workspace filters and muting.
 - [Best-effort secret masking](docs/guide.md#secret-masking), [retries and reminders](docs/guide.md#failed-sends-and-the-sweeper), and [doctor](docs/guide.md#doctor).
+
+## What this fork adds
+
+A notification policy that treats a blocked agent differently from a short turn,
+and lets the phone edit it. Full detail: [docs/guide.md](docs/guide.md#noise-control).
+
+- **Per-status floors** — `DONE_`, `BLOCKED_`, `WORKING_`, `IDLE_` and
+  `ERROR_MIN_DURATION_SECONDS`, each its own number. All of them fall back to
+  `MIN_DURATION_SECONDS`; `blocked` inherits none, because an exhausted provider
+  quota looks exactly like a turn that is still thinking and a floor there means
+  finding out hours later.
+- **`BLOCKED_REPEAT_MINUTES`** — a pane that stays blocked is reported again for
+  as long as it stands there, not only at the moment it got stuck.
+  `BLOCKED_IGNORE_QUIET_HOURS=1` lets those repeats through at night.
+- **Settings from the chat** — `/settings`, `/settings all`, `/only blocked`,
+  `/min done 120`, `/set KEY VALUE`, `/unset KEY`. The daemon re-reads the `.env`
+  per event, so nothing needs restarting. The token and chat id are deliberately
+  not writable from there.
+- **The sweeper wakes when a reminder needs it**, not only on `SWEEP_MINUTES`,
+  and never on a timer Node cannot sleep.
+
+The rules live in `policy.mjs`, with `test/policy.test.mjs`; `notify.mjs`,
+`replies.mjs` and `doctor.mjs` call into it. Upstream files are otherwise
+unchanged.
 
 ## Requirements
 
