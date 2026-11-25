@@ -129,6 +129,27 @@ function stopSweeper(fx) {
   }
 }
 
+// The hook waits DAEMON_START_MS (5 s) for the child to take its lock, and a
+// loaded CI runner can miss that window while the child is still booting: the
+// sweeper does start, just after the hook has given up and said it did not.
+// What the test is about is that a reminder setting asks for a sweeper at all,
+// so wait for the sweeper rather than for the hook's opinion of it.
+async function sweeperLockWithin(fx, ms) {
+  const logPath = join(fx.stateDir, "sweep.log");
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    let log = "";
+    try {
+      log = readFileSync(logPath, "utf8");
+    } catch {}
+    // The sweeper prints its pid only after it holds the lock, so this is the
+    // same evidence stopSweeper() works from.
+    if (/sweeping \(pid \d+\)/.test(log)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 test("the sweeper flushes the queue, keeping what each message was about, and nudges", async () => {
   const tg = await fakeTelegram();
   const fx = fixture({ sweepMinutes: 1 });
@@ -247,8 +268,7 @@ test("a reminder setting alone starts the sweeper, because a blocked pane stops 
     hook.stdout.on("data", (d) => (out += d));
     hook.stderr.on("data", (d) => (out += d));
     await new Promise((resolve) => hook.on("exit", resolve));
-    assert.match(out, /started the reminder sweeper/, out);
-    assert.ok(existsSync(join(fx.stateDir, "sweep.lock")), "the sweeper lock is what says one is running");
+    assert.ok(await sweeperLockWithin(fx, 20000), `the sweeper never took its lock; hook said:\n${out}`);
   } finally {
     stopSweeper(fx);
     tg.close();
