@@ -36,7 +36,7 @@ would come twice.
 Requirements: herdr-core, Node 18+, Linux or macOS, `flock` (util-linux).
 
 ```sh
-git clone https://github.com/naturalmoods/herdr-telegram-notify ~/.local/share/herdr-telegram-notify
+git clone https://github.com/priaculun/herdr-core-telegram-notify ~/.local/share/herdr-telegram-notify
 mkdir -p ~/.config/herdr-telegram-notify
 cp ~/.local/share/herdr-telegram-notify/.env.example ~/.config/herdr-telegram-notify/.env
 chmod 600 ~/.config/herdr-telegram-notify/.env

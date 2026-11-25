@@ -42,10 +42,12 @@ for it.
 ### Install
 
 ```
-herdr plugin install naturalmoods/herdr-telegram-notify --yes
+herdr plugin install priaculun/herdr-core-telegram-notify --yes
 ```
 
 For a local checkout, run `herdr plugin link .` from the repository directory.
+The plugin id stays `naturalmoods.herdr-telegram-notify`, so key bindings and
+`herdr plugin action invoke` lines keep working after switching to this fork.
 
 #### Letting Claude Code do it
 

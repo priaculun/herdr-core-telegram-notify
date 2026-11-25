@@ -66,11 +66,19 @@ Linux needs util-linux's `flock`. macOS: `brew install util-linux` (or
 ### Herdr TUI
 
 ```sh
-herdr plugin install naturalmoods/herdr-telegram-notify --yes
+herdr plugin install priaculun/herdr-core-telegram-notify --yes
 ```
 
 For a local checkout, run `herdr plugin link .` instead. The launcher finds
 Node outside the shell's PATH.
+
+The plugin id stays `naturalmoods.herdr-telegram-notify`, so an existing key
+binding or `herdr plugin action invoke` line keeps working after the switch. To
+follow upstream, add it as a second remote and merge from there:
+
+```sh
+git remote add upstream https://github.com/naturalmoods/herdr-telegram-notify
+```
 
 ### The Herdr app (herdr-core)
 
@@ -79,7 +87,7 @@ The app runs agents in herdr-core (`hc`), which has no plugin hooks. Run
 `hc events` and sends the same messages, also while the app window is closed.
 
 ```sh
-git clone https://github.com/naturalmoods/herdr-telegram-notify ~/.local/share/herdr-telegram-notify
+git clone https://github.com/priaculun/herdr-core-telegram-notify ~/.local/share/herdr-telegram-notify
 ```
 
 Set it up as below, then run it as a systemd user service with
