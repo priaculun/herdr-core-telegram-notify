@@ -320,13 +320,17 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       paneBits.push(focusHint(paneId));
     }
 
+    // How long it has stood there, when that is known: a state file from an
+    // older scheme carries no start time, and `NaNh` in the message is worse
+    // than leaving the line out.
+    const waited = Number.isFinite(state.updatedAt) ? Date.now() - state.updatedAt : undefined;
     const parts = {
       emoji: "⏰",
       agent: String(firstDefined(agent.agent, "agent")),
-      statusLabel: kind === "repeat" ? `still blocked (${humanDuration(Date.now() - state.updatedAt)})` : "still blocked",
+      statusLabel: kind === "repeat" && waited !== undefined ? `still blocked (${humanDuration(waited)})` : "still blocked",
       title: isOn(cfg("SHOW_TITLE")) ? info.title : undefined,
       project: projectBits.length ? `📁 ${projectBits.join(" · ")}` : undefined,
-      meta: `⏱ waiting ${humanDuration(Date.now() - state.updatedAt)}`,
+      meta: waited === undefined ? undefined : `⏱ waiting ${humanDuration(waited)}`,
       agentTokens: agentTokensLine(info.tokens, cfg("SHOW_AGENT_TOKENS")),
       pane: paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined,
       body: isOn(cfg("SHOW_SCREEN_ON_BLOCKED")) ? screenTail(paneId, toInt(cfg("SCREEN_LINES"), 12)) : undefined,

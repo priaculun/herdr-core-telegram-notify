@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Parse every entry point
         run: |
-          for f in lib.mjs core.mjs daemon.mjs notify.mjs mute.mjs doctor.mjs replies.mjs; do node --check "$f"; done
+          for f in lib.mjs core.mjs policy.mjs daemon.mjs notify.mjs mute.mjs doctor.mjs replies.mjs; do node --check "$f"; done
       - name: Shell syntax
         run: sh -n run.sh
       - name: Tests

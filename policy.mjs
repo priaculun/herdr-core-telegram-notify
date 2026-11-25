@@ -11,11 +11,12 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSy
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
-import { DEFAULTS, STATUSES, holdFlock, inQuietHours, isOn, parseQuietHours, toInt } from "./lib.mjs";
+import { DEFAULTS, STATUSES, holdFlock, inQuietHours, isOn, notifyStatuses, parseQuietHours, toInt } from "./lib.mjs";
 
-// The order a summary lists them in, which is the order they matter in to
-// someone reading it on a phone: the two that notify by default first.
-export const STATUSES_FOR_SUMMARY = ["done", "blocked", "working", "idle", "error"];
+// The order a summary lists them in: the two that notify by default first, which
+// is also the order lib.mjs already keeps them in. One list, so a status added
+// to the notifier cannot be missing from what the phone is told about it.
+export const STATUSES_FOR_SUMMARY = STATUSES;
 
 // `MIN_DURATION_SECONDS` is the global floor from 0.6 and still means what it
 // did. Each status may override it, which is what makes "quiet for done, loud
@@ -26,8 +27,12 @@ export const STATUS_MIN_DURATION_KEYS = Object.fromEntries(
 
 // Statuses whose own key falls back to MIN_DURATION_SECONDS. `blocked` is not
 // among them: it inherits nothing, so a global floor set to quiet short turns
-// cannot also swallow the question that is waiting for an answer.
-const INHERITS_GLOBAL_MIN_DURATION = STATUSES.filter((status) => status !== "blocked");
+// cannot also swallow the question that is waiting for an answer. Anything else
+// herdr reports — `closed`, which this plugin synthesises for a pane going away
+// — keeps inheriting it, the way it did before the floors were per status.
+function inheritsGlobalMinDuration(status) {
+  return status !== "blocked";
+}
 
 // A whole number as written, or undefined. toInt() cannot be used here: it
 // reports 0 as undefined, and for a floor 0 is the value that says "no floor",
@@ -43,7 +48,7 @@ export function statusMinDurationSeconds(cfg, status) {
   const key = STATUS_MIN_DURATION_KEYS[status];
   const own = key ? wholeNumber(cfg(key)) : undefined;
   if (own !== undefined) return own;
-  if (!INHERITS_GLOBAL_MIN_DURATION.includes(status)) return 0;
+  if (!inheritsGlobalMinDuration(status)) return 0;
   return toInt(cfg("MIN_DURATION_SECONDS"), 0);
 }
 
@@ -77,6 +82,12 @@ export function reminderDue(state, cfg, now = Date.now()) {
     // the first nudge or — with no first-nudge delay configured — the first
     // repeat. A repeat measured from nothing would never fire, which is why it
     // is measured from when the stretch began.
+    //
+    // No updatedAt means no known start: a state file left by an older scheme,
+    // or one written before the clock was recorded. The wait it would report is
+    // NaN, so it is treated as not due rather than nudged about with a broken
+    // duration.
+    if (!Number.isFinite(state.updatedAt)) return undefined;
     const from = firstMs || repeatMs;
     if (!from || now - state.updatedAt < from) return undefined;
     return firstMs ? "first" : "repeat";
@@ -180,6 +191,10 @@ export function validateSetting(key, value) {
     return undefined;
   }
   if (key === "NOTIFY_STATUSES") {
+    // undefined is /unset: the default comes back, which names statuses of its
+    // own. Refusing it would make the one key that decides everything the only
+    // one that cannot be put back from the chat.
+    if (value === undefined) return undefined;
     if (!text) return "NOTIFY_STATUSES needs at least one status";
     const bad = text.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s && !STATUSES.includes(s));
     return bad.length ? `${bad.join(", ")} is not a status (${STATUSES.join(", ")})` : undefined;
@@ -286,12 +301,10 @@ const duration = (seconds) => (seconds ? `${seconds}s` : "off");
 // come from the resolved config, so an env var set outside .env is shown as it
 // is really applied.
 export function policySummary(cfg, { muteUntil, envPath } = {}) {
-  const statuses = new Set(
-    String(cfg("NOTIFY_STATUSES") ?? "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-  );
+  // notifyStatuses(), not the raw key: on herdr-core it adds `error` to the
+  // default, and a summary that read the key alone would show that status as
+  // off while the notifier was sending it.
+  const statuses = new Set(notifyStatuses(cfg));
   const lines = [];
   lines.push("🔔 Notifications");
   lines.push(

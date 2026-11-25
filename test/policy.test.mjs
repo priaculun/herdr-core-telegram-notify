@@ -175,7 +175,21 @@ test("a value is checked before it is written, and the reason says what is wrong
   assert.match(validateSetting("TELEGRAM_BOT_TOKEN", "123:abc"), /not a notification setting/);
   // Unset means back to the default, which is only allowed where a default is.
   assert.equal(validateSetting("QUIET_HOURS", undefined), undefined);
-  assert.match(validateSetting("NOTIFY_STATUSES", undefined), /at least one status/);
+  // NOTIFY_STATUSES has a default too, so it can be put back from the chat: an
+  // empty value is still refused, because that would name no status at all.
+  assert.equal(validateSetting("NOTIFY_STATUSES", undefined), undefined);
+});
+
+test("a state with no known start is not nudged about with a broken wait", () => {
+  // A state file from an older scheme carries no updatedAt. Reporting it would
+  // put `NaNh` where the wait belongs, which is worse than staying quiet about
+  // a stretch whose length nobody recorded.
+  const cfg = (key) => ({ BLOCKED_REPEAT_MINUTES: "10" })[key];
+  assert.equal(reminderDue({ status: "blocked", paneId: "p1" }, cfg, Date.now()), undefined);
+  assert.equal(
+    reminderDue({ status: "blocked", paneId: "p1", updatedAt: Date.now() - 3600_000 }, cfg, Date.now()),
+    "repeat"
+  );
 });
 
 test("a write keeps the rest of the file, including comments and the token", () => {
