@@ -332,7 +332,7 @@ test("with no first delay, the repeat still arrives", async () => {
     await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 1 });
     const texts = tg.sent.map((m) => m.text);
     assert.match(texts[0], /still blocked/, texts.join("\n---\n"));
-    assert.match(texts[0], /waiting 5m/);
+    assert.match(texts[0], /waiting 5m( \d+s)?/);
   } finally {
     tg.close();
   }
@@ -352,16 +352,27 @@ test("a blocked agent is reported again while it is still blocked, not only once
       JSON.stringify({ status: "blocked", updatedAt: nudged, remindedAt: nudged, paneId: "wA:p1" })
     );
 
-    await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 1 });
+    // Waited on the state file rather than on the send: the record is written
+    // just after the send returns, so killing the sweeper on the send alone
+    // races that write on a slow runner.
+    const stateNow = () => {
+      try {
+        return JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
+      } catch {
+        return {};
+      }
+    };
+    await runSweeper(fx, tg.base, { until: () => stateNow().remindedAt > nudged });
     const first = tg.sent[0].text;
     assert.match(first, /still blocked/);
     // How long it has been waiting is the whole point of the repeat: a second
-    // copy of the first message would be noise.
-    assert.match(first, /waiting 10m/);
-    assert.match(first, /still blocked \(10m\)/);
+    // copy of the first message would be noise. Tolerant of the seconds, because
+    // the clock is read when the message is built, not when the test set it up.
+    assert.match(first, /waiting 10m( \d+s)?/);
+    assert.match(first, /still blocked \(10m( \d+s)?\)/);
     // The clock restarts at the repeat, so the next one is a minute later and
     // not on every pass.
-    const state = JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
+    const state = stateNow();
     assert.ok(state.remindedAt > nudged, "the repeat did not record when it happened");
 
     // Move that clock back rather than sleep a minute: the second repeat is the
