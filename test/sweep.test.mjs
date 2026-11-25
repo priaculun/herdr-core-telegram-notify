@@ -112,6 +112,23 @@ function runSweeper(fx, base, { until, timeoutMs = 15000 }) {
   });
 }
 
+// A hook that starts the sweeper leaves a detached process behind on purpose,
+// so a test that starts one has to stop it or the next run finds the lock taken.
+// The sweeper says its own pid on the way in, which is how it is found again.
+function stopSweeper(fx) {
+  let log = "";
+  try {
+    log = readFileSync(join(fx.stateDir, "sweep.log"), "utf8");
+  } catch {
+    return;
+  }
+  for (const [, pid] of log.matchAll(/sweeping \(pid (\d+)\)/g)) {
+    try {
+      process.kill(Number(pid), "SIGKILL");
+    } catch {}
+  }
+}
+
 test("the sweeper flushes the queue, keeping what each message was about, and nudges", async () => {
   const tg = await fakeTelegram();
   const fx = fixture({ sweepMinutes: 1 });
@@ -233,6 +250,7 @@ test("a reminder setting alone starts the sweeper, because a blocked pane stops 
     assert.match(out, /started the reminder sweeper/, out);
     assert.ok(existsSync(join(fx.stateDir, "sweep.lock")), "the sweeper lock is what says one is running");
   } finally {
+    stopSweeper(fx);
     tg.close();
   }
 });

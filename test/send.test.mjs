@@ -121,6 +121,24 @@ function hook(fx, base, paneId, { title, status = "done", closed = false, contex
   return new Promise((resolve) => child.on("exit", (code) => resolve({ out, code })));
 }
 
+// A hook that starts the sweeper leaves a detached process behind on purpose, so
+// a test whose fixture sets a reminder has to stop it: the next run would find
+// the lock taken and see the sweeper it did not start. The sweeper names its own
+// pid on the way in, which is how it is found again.
+function stopSweeper(fx) {
+  let log = "";
+  try {
+    log = readFileSync(join(fx.stateDir, "sweep.log"), "utf8");
+  } catch {
+    return;
+  }
+  for (const [, pid] of log.matchAll(/sweeping \(pid (\d+)\)/g)) {
+    try {
+      process.kill(Number(pid), "SIGKILL");
+    } catch {}
+  }
+}
+
 const lines = (path) =>
   existsSync(path)
     ? readFileSync(path, "utf8")
@@ -207,6 +225,7 @@ test("blocked reminders include fresh selected agent metadata after the waiting 
     assert.match(tg.sent[0].text, /⏱ waiting [^\n]+\n📊 Model Cedar/);
     assert.equal(remembered(fx)[0].parts.agentTokens, "📊 Model Cedar");
   } finally {
+    stopSweeper(fx);
     tg.close();
   }
 });
