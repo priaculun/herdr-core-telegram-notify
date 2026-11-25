@@ -1,0 +1,242 @@
+1085:export function holdFlock(path, { waitSeconds = 0 } = {}) {
+1086-  const bin = flockBin();
+1087-  if (!bin) return undefined;
+1088-  const ready = `${path}.${process.pid}.${randomUUID()}.ready`;
+1089-  let child;
+1090-  try {
+1091-    mkdirSync(dirname(path), { recursive: true });
+1092-    child = spawn(
+1093-      "/bin/sh",
+1094-      [
+1095-        "-c",
+1096-        'exec 9>"$1" || { echo no > "$0"; exit 3; }; ' +
+1097-          `"$2" ${waitSeconds > 0 ? `-w ${waitSeconds}` : "-n"} 9 || { echo no > "$0"; exit 3; }; ` +
+1098-          'echo "$$" > "$0"; read ignored',
+1099-        ready,
+1100-        path,
+1101-        bin,
+1102-      ],
+1103-      { stdio: ["pipe", "ignore", "ignore"] }
+1104-    );
+1105-    // Neither the child nor the pipe may keep this process alive: the pipe
+1106-    // closing is exactly how the lock is released when we go.
+1107-    child.unref();
+1108-    child.stdin.unref?.();
+1109-  } catch {
+1110-    return undefined;
+1111-  }
+1112-
+1113-  // The child writes its pid on success and `no` on failure, either way within
+1114-  // waitSeconds. Past that something is wrong with the child rather than with
+1115-  // the lock, and giving up is the same answer as being refused.
+1116-  const deadline = Date.now() + waitSeconds * 1000 + LOCK_START_GRACE_MS;
+1117-  for (;;) {
+1118-    let marker;
+1119-    try {
+1120-      marker = readFileSync(ready, "utf8").trim();
+1121-    } catch {}
+1122-    if (marker) {
+1123-      try {
+1124-        unlinkSync(ready);
+1125-      } catch {}
+---
+115:export function loadEnvFile(dir) {
+116-  if (!dir) return {};
+117-  try {
+118-    const file = join(dir, ".env");
+119-    const text = readFileSync(file, "utf8");
+120-    warnIfWorldReadable(file);
+121-    const out = {};
+122-    for (const line of text.split("\n")) {
+123-      const trimmed = line.trim();
+124-      if (!trimmed || trimmed.startsWith("#")) continue;
+125-      const eq = trimmed.indexOf("=");
+126-      if (eq === -1) continue;
+127-      const key = trimmed.slice(0, eq).trim();
+128-      let value = trimmed.slice(eq + 1).trim();
+129-      if (
+130-        (value.startsWith('"') && value.endsWith('"')) ||
+131-        (value.startsWith("'") && value.endsWith("'"))
+132-      ) {
+133-        value = value.slice(1, -1);
+134-      }
+135-      out[key] = value;
+136-    }
+137-    return out;
+138-  } catch {
+139-    return {};
+140-  }
+141-}
+142-
+143-// Keys the plugin reads that have no default: the two required ones, and the
+144-// mute length the mute action and a bare /mute use.
+145-export const EXTRA_KEYS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "MUTE_MINUTES"];
+146-
+147-// A .env key nobody reads is silent by nature: SHOW_TOKEN looks exactly like a
+148-// setting that is working, and the message it was meant to change never changes.
+149-export function warnUnknownKeys(fileEnv) {
+150-  const known = [...Object.keys(DEFAULTS), ...EXTRA_KEYS];
+151-  const lookup = known.map((k) => k.toLowerCase());
+152-  for (const key of Object.keys(fileEnv)) {
+153-    if (known.includes(key)) continue;
+154-    const lower = key.toLowerCase();
+155-    // A wrong case, a missing letter or one too many — the typos a list of every
+--
+167:export function loadConfig() {
+168-  const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
+169-  warnUnknownKeys(fileEnv);
+170-  const cfg = (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+171-  // A key the user set, as opposed to one that fell back to DEFAULTS.
+172-  cfg.userSet = (key) => firstDefined(process.env[key], fileEnv[key]) !== undefined;
+173-  return cfg;
+174-}
+175-
+176-// The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
+177-// `error` comes from herdr-core only.
+178-export const STATUSES = ["done", "blocked", "working", "idle", "error"];
+179-
+180-// The statuses a run notifies on. herdr-core reports `error`, which the TUI
+181-// never does, so it is heard by default there too — unless the user wrote
+182-// NOTIFY_STATUSES, whose list is then taken exactly as it stands.
+183:export function notifyStatuses(cfg) {
+184-  const list = String(cfg("NOTIFY_STATUSES") ?? "")
+185-    .split(",")
+186-    .map((s) => s.trim().toLowerCase())
+187-    .filter(Boolean);
+188-  if (isCore() && !cfg.userSet?.("NOTIFY_STATUSES") && !list.includes("error")) list.push("error");
+189-  return list;
+190-}
+191-
+192-// A value the runtime cannot parse falls back to the default, silently — the
+193-// failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
+194-// file that looks right. Every rule here is the runtime's own parser (toInt,
+195-// parseQuietHours, the status split), so the two cannot disagree: this only
+196-// names what the runtime would ignore. Keys, never values, of anything secret.
+197-export function configProblems(cfg) {
+198-  const problems = [];
+199-  const say = (key, detail) => problems.push({ key, detail });
+200-
+201-  // Empty means "the default", which is always valid; 0 is off for durations
+202-  // and is not allowed for the sizes.
+203-  for (const [key, min, max] of [
+204-    ["PROMPT_CHARS", 1],
+205-    ["LAST_MESSAGE_CHARS", 1],
+206-    ["SCREEN_LINES", 1],
+207-    ["MUTE_MINUTES", 1],
+208-    ["TELEGRAM_TOPIC_ID", 1],
+209-    ["MIN_DURATION_SECONDS", 0],
+210-    ["DONE_MIN_DURATION_SECONDS", 0],
+211-    ["BLOCKED_MIN_DURATION_SECONDS", 0],
+212-    ["WORKING_MIN_DURATION_SECONDS", 0],
+213-    ["IDLE_MIN_DURATION_SECONDS", 0],
+214-    ["ERROR_MIN_DURATION_SECONDS", 0],
+215-    ["BLOCKED_DELAY_SECONDS", 0, BLOCKED_DELAY_MAX_SECONDS],
+216-    ["BLOCKED_REMINDER_MINUTES", 0],
+217-    ["BLOCKED_REPEAT_MINUTES", 0],
+218-    ["SWEEP_MINUTES", 0],
+219-  ]) {
+220-    const raw = String(cfg(key) ?? "").trim();
+221-    if (!raw) continue;
+222-    const value = toInt(raw, undefined);
+223-    if (value === undefined && !(min === 0 && raw === "0")) {
+--
+288:export function isOn(value) {
+289-  return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
+290-}
+291-
+292-// Whole number or nothing: `12min` is a typo, and taking the 12 out of it would
+293-// hide the typo behind a value that happens to work. The doctor reports exactly
+294-// what this rejects, which is why it is one function and not two.
+295:export function toInt(value, fallback) {
+296-  const raw = String(value ?? "").trim();
+297-  return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : fallback;
+298-}
+299-
+300-// The bot token is in the request URL, so anything that quotes the URL back —
+301-// a fetch error, a stack trace — would put it in a log file. The pattern catches
+302-// a token-shaped string even where the token itself was not passed in, which is
+303-// the case anywhere config has not been read yet.
+304-export function redact(text, token) {
+305-  const s = token ? String(text).split(token).join("<token>") : String(text);
+306-  // No leading boundary: in a request URL the token follows `bot` directly, and
+307-  // `t8735…` is not a word boundary at all.
+308-  return s.replace(/\d{5,}:[A-Za-z0-9_-]{20,}/g, "<token>");
+309-}
+310-
+311-// One message masks a dozen fields, and loadConfig() rereads .env and repeats
+312-// its warnings every time, so the setting is read again only when .env changes.
+313-// The long-running poller still sees an edit without a restart.
+314-let masking; // [what it was read from, on]
+315-function maskingOn() {
+316-  const dir = process.env.HERDR_PLUGIN_CONFIG_DIR;
+317-  const mtime = (dir && statSync(join(dir, ".env"), { bigint: true, throwIfNoEntry: false })?.mtimeNs) || 0n;
+318-  const from = `${dir}|${mtime}|${process.env.MASK_SECRETS}`;
+319-  if (masking?.[0] !== from) masking = [from, isOn(loadConfig()("MASK_SECRETS"))];
+320-  return masking[1];
+321-}
+322-
+323-// Telegram chats are not end-to-end encrypted, so captured text must not carry
+324-// recognizable credentials. These shapes are best-effort, not a security guarantee.
+325-export function maskSecrets(text) {
+326-  let s = String(text ?? "");
+327-  if (!maskingOn()) return s;
+328-
+329-  // Remove the whole PEM block before matching individual values, since its
+330-  // body can span many lines and has no identifying prefix of its own.
+331-  s = s.replace(/-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g, "$1 …[masked]");
+332-  s = s.replace(
+333-    /(?<![\w])((["']?)([A-Za-z_][A-Za-z0-9_]*)\2\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s"'`,;})]+))/g,
+334-    (match, head, _quote, name, double, single, bare) => {
+335-      const value = double ?? single ?? bare;
+--
+695:export function parseQuietHours(spec) {
+696-  const match = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(String(spec ?? ""));
+697-  if (!match) return undefined;
+698-  const [fromH, fromM, toH, toM] = match.slice(1).map(Number);
+699-  if (fromH > 23 || toH > 23 || fromM > 59 || toM > 59) return undefined;
+700-  const from = fromH * 60 + fromM;
+701-  const to = toH * 60 + toM;
+702-  return from === to ? undefined : { from, to };
+703-}
+704-
+705:export function inQuietHours(spec, now = new Date()) {
+706-  const window = parseQuietHours(spec);
+707-  if (!window) return false;
+708-  const { from, to } = window;
+709-  const minutes = now.getHours() * 60 + now.getMinutes();
+710-  return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
+711-}
+712-
+713-// A turn that cost four tenths of a cent is the common case, and `$0.00` says
+714-// nothing about it — so the precision follows the number down. Two decimals
+715-// above a dime, because money written `$1.2` reads like a typo.
+716-export function humanCost(cost) {
+717-  if (cost >= 0.1) return `$${cost.toFixed(2)}`;
+718-  if (cost < 0.0005) return "<$0.001";
+719-  return `$${cost.toFixed(cost >= 0.01 ? 3 : 4).replace(/0+$/, "")}`;
+720-}
+721-
+722-export function clockTime(date) {
+723-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+724-}
+725-
+726-export function truncate(text, max) {
+727-  const collapsed = text.replace(/\n{3,}/g, "\n\n").trim();
+728-  if (collapsed.length <= max) return collapsed;
+729-  return `${collapsed.slice(0, max).replace(/\s+\S*$/, "")} …`;
+730-}
+731-
+732-// What the person actually typed, out of a record that also carries whatever the
+733-// harness wrapped around it.
+734-export function promptText(raw) {
+735-  const text = String(raw ?? "");
+736-  // A slash command arrives as a wrapper around its name; the name is the ask.
+737-  const command = /<command-name>([^<]+)<\/command-name>/.exec(text);
+738-  if (command) return command[1].trim();
+739-  // A background task finishing starts a turn of its own, written as a user
+740-  // record; its summary says what woke the agent, the XML around it nothing.
+741-  const task = /<task-notification>[\s\S]*?<summary>([^<]+)<\/summary>/.exec(text);
+742-  if (task) return `↻ ${task[1].trim()}`;
+743-  return text
+744-    .replace(/<(system-reminder|task-notification|local-command-[a-z]+|command-[a-z]+)>[\s\S]*?<\/\1>/g, "")
+745-    .trim();

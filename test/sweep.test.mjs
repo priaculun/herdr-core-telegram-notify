@@ -16,15 +16,18 @@ const HERE = fileURLToPath(new URL(".", import.meta.url));
 const NOTIFY = join(HERE, "..", "notify.mjs");
 
 // Collects every sendMessage the sweeper makes, and answers as Telegram does.
-async function fakeTelegram() {
+async function fakeTelegram(script = []) {
   const sent = [];
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
       sent.push(JSON.parse(body || "{}"));
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, result: { message_id: sent.length } }));
+      const next = script.shift() ?? { status: 200 };
+      res.writeHead(next.status, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(next.body ?? (next.status === 200 ? { ok: true, result: { message_id: sent.length } } : { ok: false }))
+      );
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -272,6 +275,38 @@ test("a reminder setting alone starts the sweeper, because a blocked pane stops 
   } finally {
     stopSweeper(fx);
     tg.close();
+  }
+});
+
+test("a nudge Telegram refused is owed again, not lost for the stretch", async () => {
+  // The one thing BLOCKED_REMINDER_MINUTES exists to report is an agent standing
+  // still. Marking the stretch as nudged before the send means a single failure
+  // silences that agent for as long as it stands there, because with repeats off
+  // nothing else ever owes a message about it.
+  //
+  // Two separate passes rather than one process waiting for its own timer: the
+  // sweep interval has a 30s floor, and what is under test is the state file the
+  // failed pass left behind. 403 is not retried inside sendTelegram, so this is
+  // the refused send itself and not that retry loop.
+  const fx = fixture({ reminderMinutes: 1 });
+  const refused = await fakeTelegram([{ status: 403 }, { status: 403 }]);
+  const working = await fakeTelegram();
+  try {
+    writeFileSync(join(fx.stateDir, "state-wA_p1.json"), blocked("wA:p1", 10));
+    // First pass: Telegram refuses, so nothing may be recorded as nudged.
+    await runSweeper(fx, refused.base, { until: () => refused.sent.length >= 1 });
+    const afterFailure = JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
+    assert.equal(afterFailure.remindedAt, undefined, "a refused nudge must not count as sent");
+
+    // Second pass: the same stretch still owes its nudge, and gets it.
+    await runSweeper(fx, working.base, { until: () => working.sent.length >= 1 });
+    const texts = working.sent.map((m) => m.text);
+    assert.match(texts[0], /still blocked/, texts.join("\n---\n"));
+    const afterSuccess = JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
+    assert.ok(afterSuccess.remindedAt, "a delivered nudge is recorded, so it is not sent again");
+  } finally {
+    refused.close();
+    working.close();
   }
 });
 

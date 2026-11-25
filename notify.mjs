@@ -345,10 +345,13 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
     parts.options = menuOptions(cfg, question, parts.body);
     parts.actions = actionButtons(cfg, { blocked: true });
 
-    // Marked first: a reminder that fails is not worth queueing — by the time it
-    // could be delivered the wait it reports is no longer the wait there is.
-    writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
-    sent += 1;
+    // Marked only once Telegram has taken it. The other order loses the nudge
+    // for good: with BLOCKED_REPEAT_MINUTES off, `remindedAt` set by a send that
+    // then failed means this stretch never owes another message, and the one
+    // thing the setting exists to report — an agent standing still — goes
+    // unreported. Nothing is lost by leaving it unmarked on failure either: the
+    // next pass rebuilds the message from the current wait, so what arrives is
+    // the wait there is, not the one there was.
     try {
       const messageId = await sendTelegram(token, chatId, message, {
         silent,
@@ -359,6 +362,8 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
         parts,
       });
       rememberMessage(stateDir, messageId, paneId, info.session, question, undefined, parts);
+      writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
+      sent += 1;
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
     }
