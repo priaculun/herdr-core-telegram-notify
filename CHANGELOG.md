@@ -12,16 +12,16 @@ at `f15304d`; the entries below are what this fork adds on top.
 - Notification settings are edited from the chat: `/settings` shows what reaches
   the phone now, `/only blocked` narrows it to one status, `/min done 120` sets a
   floor, and `/set KEY VALUE` / `/unset KEY` change anything else. Each writes the
-  `.env` in the config dir, so the next event reads it — no restart, and the
+  `.env` in the config dir, so the next event reads it without a restart, and the
   token and comments in that file are kept. The bot's `/` menu lists them.
 - `BLOCKED_REPEAT_MINUTES` keeps reporting an agent that is still blocked, for
   as long as it stands there, instead of only at the moment it got stuck. This
   is the mid-run report: a blocked agent raises no further events, so an agent
-  waiting on a question — or on a provider quota that ran out — was silent
-  after its first message. Each repeat carries how long it has been waiting. Off
-  by default; it starts the sweeper on its own, since there is no event to ride
-  on — and so does `BLOCKED_REMINDER_MINUTES`, which otherwise waited for an
-  event that a blocked pane never sends.
+  waiting on a question, or on a provider quota that ran out, was silent after
+  its first message. Each repeat carries how long it has been waiting. Off by
+  default; it starts the sweeper on its own, since there is no event to ride on.
+  `BLOCKED_REMINDER_MINUTES` does the same, having otherwise waited for an event
+  that a blocked pane never sends.
 - Durations are per status. `DONE_MIN_DURATION_SECONDS`,
   `WORKING_MIN_DURATION_SECONDS`, `IDLE_MIN_DURATION_SECONDS` and
   `ERROR_MIN_DURATION_SECONDS` override `MIN_DURATION_SECONDS`, so "quiet for

@@ -625,7 +625,7 @@ Each status can have its own floor instead: `DONE_MIN_DURATION_SECONDS`,
 `WORKING_MIN_DURATION_SECONDS`, `IDLE_MIN_DURATION_SECONDS`,
 `ERROR_MIN_DURATION_SECONDS`. Empty means "use `MIN_DURATION_SECONDS`".
 `BLOCKED_MIN_DURATION_SECONDS` is the exception in both directions: it is the
-only way to give a blocked agent a floor, and it inherits the global one never —
+only way to give a blocked agent a floor, and it never inherits the global one:
 a quota that ran out looks exactly like a long turn, and silence is the one
 answer that costs money. From the chat, `/min done 120` and `/min blocked off`
 set them.
@@ -696,15 +696,15 @@ before sending to confirm the agent is still blocked. Off by default. Its
 clock starts when the agent became blocked, not when a delayed message sent.
 
 `BLOCKED_REPEAT_MINUTES` keeps reporting the same agent for as long as it is
-still blocked — the mid-run report, where the one above is a single nudge. This
+still blocked: the mid-run report, where the one above is a single nudge. This
 is the setting for an agent that is waiting on a question, or on a provider
 quota that ran out: it raises no further events, so nothing else would say it is
 still there. Each repeat carries how long it has been waiting. Off by default;
 `10` reports every ten minutes. It is not gated by any `MIN_DURATION_SECONDS`,
 including `BLOCKED_MIN_DURATION_SECONDS`.
 
-Both need a clock, and a blocked pane raises no event to ride on — it is
-standing still, which is the whole situation being reported — so either setting
+Both need a clock, and a blocked pane raises no event to ride on. It is
+standing still, which is the whole situation being reported, so either setting
 on its own starts the sweeper below. Without one, the nudge or the repeat would
 be waiting for a status change that will never come.
 
