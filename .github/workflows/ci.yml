@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install kernel locking utility
+        run: brew install util-linux
+      - name: Tests
+        run: node --test test/*.test.mjs
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is what the manifest and run.sh promise; the rest are what people
+        # actually have installed.
+        node: ["18", "20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Parse every entry point
+        run: |
+          for f in lib.mjs core.mjs daemon.mjs notify.mjs mute.mjs doctor.mjs replies.mjs; do node --check "$f"; done
+      - name: Shell syntax
+        run: sh -n run.sh
+      - name: Tests
+        run: node --test test/*.test.mjs
+      - name: The hook runs with nothing configured
+        # No herdr, no config, no state: it must degrade rather than throw.
+        run: |
+          out=$(HERDR_PLUGIN_EVENT_JSON='{"data":{"pane_id":"wA:p1","agent_status":"done","agent":"claude"}}' \
+                HERDR_PLUGIN_CONTEXT_JSON='{}' DRY_RUN=1 node notify.mjs)
+          echo "$out"
+          case "$out" in *"claude · done"*) ;; *) echo "no message built"; exit 1 ;; esac

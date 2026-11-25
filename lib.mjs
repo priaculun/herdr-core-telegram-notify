@@ -1,0 +1,1878 @@
+// Plumbing the notifier, the mute action and the doctor all share: what the
+// config keys are, how a value is resolved from them, where herdr's binary is,
+// and how not to print a bot token. One copy, so a fix to any of it reaches all
+// three. The message itself is built in notify.mjs.
+
+import {
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  statSync,
+  openSync,
+  readSync,
+  fstatSync,
+  closeSync,
+  unlinkSync,
+  rmSync,
+  chmodSync,
+} from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
+import { performance } from "node:perf_hooks";
+import { coreAgent, coreMachines, guessTranscript, hcJson, hcRun, isCore, loadCoreSnapshot, remoteTranscript } from "./core.mjs";
+
+export { isCore };
+
+
+// Every key is overridable from the plugin config dir's .env (see .env.example).
+export const DEFAULTS = {
+  NOTIFY_STATUSES: "done,blocked",
+  SHOW_TITLE: "1",
+  SHOW_PROMPT: "1",
+  PROMPT_CHARS: "120",
+  SHOW_PROJECT: "1",
+  SHOW_BRANCH: "1",
+  SHOW_CHANGES: "1",
+  SHOW_DURATION: "1",
+  SHOW_TIMESTAMP: "0",
+  SHOW_TOKENS: "1",
+  SHOW_AGENT_TOKENS: "",
+  SHOW_TOOLS: "0",
+  SHOW_PANE: "1",
+  SHOW_HOST: "1",
+  SHOW_HERD: "1",
+  SHOW_LAST_MESSAGE: "1",
+  SHOW_SCREEN_ON_BLOCKED: "1",
+  MASK_SECRETS: "1",
+  LAST_MESSAGE_CHARS: "1200",
+  SCREEN_LINES: "12",
+  MIN_DURATION_SECONDS: "0",
+  // Per-status floors, so "quiet for done, loud for blocked" is a setting. A
+  // status with its own key uses it; the others fall back to
+  // MIN_DURATION_SECONDS, except blocked, which inherits nothing (see
+  // policy.mjs). Empty means the fallback.
+  DONE_MIN_DURATION_SECONDS: "",
+  BLOCKED_MIN_DURATION_SECONDS: "",
+  WORKING_MIN_DURATION_SECONDS: "",
+  IDLE_MIN_DURATION_SECONDS: "",
+  ERROR_MIN_DURATION_SECONDS: "",
+  BLOCKED_DELAY_SECONDS: "0",
+  BLOCKED_REMINDER_MINUTES: "0",
+  // Keep nudging a pane that is still blocked, rather than once per stretch.
+  BLOCKED_REPEAT_MINUTES: "0",
+  // A blocked agent is the one that can be worth waking up for.
+  BLOCKED_IGNORE_QUIET_HOURS: "0",
+  SWEEP_MINUTES: "0",
+  QUIET_HOURS: "",
+  TELEGRAM_TOPIC_ID: "",
+  TELEGRAM_TOPICS: "",
+  NOTIFY_WORKSPACES: "",
+  IGNORE_WORKSPACES: "",
+  REPLIES: "0",
+  REPLY_ALLOWED_USER_IDS: "",
+  MARK_RESOLVED: "1",
+  SIDEBAR_TOKENS: "1",
+  WHISPER_BIN: "",
+  WHISPER_MODEL: "small",
+  WHISPER_LANGUAGE: "",
+  BOARD: "0",
+  // herdr-core only: the programs /new may start (it runs them by name), and
+  // the added machines this daemon also notifies for (see docs/core.md).
+  CORE_AGENT_KINDS: "claude,codex,pi,opencode,gemini",
+  CORE_MACHINES: "",
+  DEBUG: "0",
+  DRY_RUN: "0",
+};
+
+export const BLOCKED_DELAY_MAX_SECONDS = 120;
+
+export function firstDefined(...values) {
+  for (const v of values) {
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
+}
+
+// The .env holds the bot token, and anyone holding it can post as the bot. Herdr
+// creates the config dir with the default umask, so the file is usually born
+// world-readable — say so on every run that reads a loose one, with the fix.
+export function warnIfWorldReadable(path) {
+  try {
+    const mode = statSync(path).mode & 0o777;
+    if (mode & 0o077) {
+      console.error(
+        `herdr-telegram-notify: ${path} is readable by other users (mode ${mode.toString(8)}) and holds your bot token — run: chmod 600 ${path}`
+      );
+    }
+  } catch {}
+}
+
+export function loadEnvFile(dir) {
+  if (!dir) return {};
+  try {
+    const file = join(dir, ".env");
+    const text = readFileSync(file, "utf8");
+    warnIfWorldReadable(file);
+    const out = {};
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq === -1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// Keys the plugin reads that have no default: the two required ones, and the
+// mute length the mute action and a bare /mute use.
+export const EXTRA_KEYS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "MUTE_MINUTES"];
+
+// A .env key nobody reads is silent by nature: SHOW_TOKEN looks exactly like a
+// setting that is working, and the message it was meant to change never changes.
+export function warnUnknownKeys(fileEnv) {
+  const known = [...Object.keys(DEFAULTS), ...EXTRA_KEYS];
+  const lookup = known.map((k) => k.toLowerCase());
+  for (const key of Object.keys(fileEnv)) {
+    if (known.includes(key)) continue;
+    const lower = key.toLowerCase();
+    // A wrong case, a missing letter or one too many — the typos a list of every
+    // valid key would not help you find.
+    const index = lookup.findIndex((k) => k === lower || k.startsWith(lower) || lower.startsWith(k));
+    console.error(
+      `herdr-telegram-notify: .env sets ${key}, which this plugin does not read${index === -1 ? "" : ` — did you mean ${known[index]}?`}`
+    );
+  }
+}
+
+// The process env wins over the config dir's .env, which wins over DEFAULTS —
+// so a single run can be overridden (DRY_RUN=1, SCREEN_LINES=40) without
+// editing the file that holds the persistent setup.
+export function loadConfig() {
+  const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
+  warnUnknownKeys(fileEnv);
+  const cfg = (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+  // A key the user set, as opposed to one that fell back to DEFAULTS.
+  cfg.userSet = (key) => firstDefined(process.env[key], fileEnv[key]) !== undefined;
+  return cfg;
+}
+
+// The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
+// `error` comes from herdr-core only.
+export const STATUSES = ["done", "blocked", "working", "idle", "error"];
+
+// The statuses a run notifies on. herdr-core reports `error`, which the TUI
+// never does, so it is heard by default there too — unless the user wrote
+// NOTIFY_STATUSES, whose list is then taken exactly as it stands.
+export function notifyStatuses(cfg) {
+  const list = String(cfg("NOTIFY_STATUSES") ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (isCore() && !cfg.userSet?.("NOTIFY_STATUSES") && !list.includes("error")) list.push("error");
+  return list;
+}
+
+// A value the runtime cannot parse falls back to the default, silently — the
+// failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
+// file that looks right. Every rule here is the runtime's own parser (toInt,
+// parseQuietHours, the status split), so the two cannot disagree: this only
+// names what the runtime would ignore. Keys, never values, of anything secret.
+export function configProblems(cfg) {
+  const problems = [];
+  const say = (key, detail) => problems.push({ key, detail });
+
+  // Empty means "the default", which is always valid; 0 is off for durations
+  // and is not allowed for the sizes.
+  for (const [key, min, max] of [
+    ["PROMPT_CHARS", 1],
+    ["LAST_MESSAGE_CHARS", 1],
+    ["SCREEN_LINES", 1],
+    ["MUTE_MINUTES", 1],
+    ["TELEGRAM_TOPIC_ID", 1],
+    ["MIN_DURATION_SECONDS", 0],
+    ["DONE_MIN_DURATION_SECONDS", 0],
+    ["BLOCKED_MIN_DURATION_SECONDS", 0],
+    ["WORKING_MIN_DURATION_SECONDS", 0],
+    ["IDLE_MIN_DURATION_SECONDS", 0],
+    ["ERROR_MIN_DURATION_SECONDS", 0],
+    ["BLOCKED_DELAY_SECONDS", 0, BLOCKED_DELAY_MAX_SECONDS],
+    ["BLOCKED_REMINDER_MINUTES", 0],
+    ["BLOCKED_REPEAT_MINUTES", 0],
+    ["SWEEP_MINUTES", 0],
+  ]) {
+    const raw = String(cfg(key) ?? "").trim();
+    if (!raw) continue;
+    const value = toInt(raw, undefined);
+    if (value === undefined && !(min === 0 && raw === "0")) {
+      say(key, `${raw} is not a whole number of ${min} or more — the value is ignored and the default used instead`);
+    } else if (max !== undefined && value > max) {
+      say(key, `${raw} exceeds ${max} — the value is capped at ${max}`);
+    }
+  }
+
+  const statuses = String(cfg("NOTIFY_STATUSES") ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  // An unset key falls back to the default, so only a value that parses to
+  // nothing gets here — and it would drop every message.
+  // The list is used as written, typo and all — there is no falling back to the
+  // default here, which is what makes a misspelt status quieter than a missing
+  // key: everything else in the list goes on sending.
+  if (!statuses.length) say("NOTIFY_STATUSES", "names no status, so nothing would ever send");
+  const unknown = statuses.filter((s) => !STATUSES.includes(s));
+  if (unknown.length) {
+    const rest = statuses.filter((s) => STATUSES.includes(s));
+    say(
+      "NOTIFY_STATUSES",
+      `${unknown.join(", ")} — not a status (${STATUSES.join(", ")}); it matches nothing, so only ${rest.join(", ") || "nothing"} sends`
+    );
+  }
+
+  const quiet = String(cfg("QUIET_HOURS") ?? "").trim();
+  if (quiet && !parseQuietHours(quiet)) {
+    say("QUIET_HOURS", `${quiet} — not HH:MM-HH:MM, or an empty window; no hours are kept quiet`);
+  }
+
+  for (const pair of String(cfg("TELEGRAM_TOPICS") ?? "").split(",")) {
+    const text = pair.trim();
+    if (!text) continue;
+    const at = text.lastIndexOf(":");
+    if (at < 1 || !toInt(text.slice(at + 1), undefined)) {
+      say("TELEGRAM_TOPICS", `${text} — not a workspace:topic pair with a positive topic id; the pair routes nothing`);
+    }
+  }
+
+  for (const id of String(cfg("REPLY_ALLOWED_USER_IDS") ?? "").split(",")) {
+    const text = id.trim();
+    if (text && !toInt(text, undefined)) {
+      // The list stays in force with the rest of its ids: a typo here narrows
+      // who may reply, it does not turn the allowlist off.
+      say("REPLY_ALLOWED_USER_IDS", `${text} — not a Telegram user id; it matches no one, and the other ids still apply`);
+    }
+  }
+
+  for (const [key, what] of [["MASK_SECRETS", "secret masking"], ["SIDEBAR_TOKENS", "sidebar reporting"]]) {
+    const value = String(cfg(key) ?? "").toLowerCase();
+    if (value && !["1", "true", "yes", "on", "0", "false", "no", "off"].includes(value)) {
+      say(key, `${value} — not 1/true/yes/on or 0/false/no/off; ${what} is off`);
+    }
+  }
+
+  for (const selector of String(cfg("SHOW_AGENT_TOKENS") ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (selector !== "*" && !/^[A-Za-z0-9_-]{1,32}\*?$/.test(selector)) {
+      say("SHOW_AGENT_TOKENS", `${selector} — not a token name with an optional trailing *; it matches nothing, and the other selectors still apply`);
+    }
+  }
+
+  return problems;
+}
+
+export function isOn(value) {
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
+}
+
+// Whole number or nothing: `12min` is a typo, and taking the 12 out of it would
+// hide the typo behind a value that happens to work. The doctor reports exactly
+// what this rejects, which is why it is one function and not two.
+export function toInt(value, fallback) {
+  const raw = String(value ?? "").trim();
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : fallback;
+}
+
+// The bot token is in the request URL, so anything that quotes the URL back —
+// a fetch error, a stack trace — would put it in a log file. The pattern catches
+// a token-shaped string even where the token itself was not passed in, which is
+// the case anywhere config has not been read yet.
+export function redact(text, token) {
+  const s = token ? String(text).split(token).join("<token>") : String(text);
+  // No leading boundary: in a request URL the token follows `bot` directly, and
+  // `t8735…` is not a word boundary at all.
+  return s.replace(/\d{5,}:[A-Za-z0-9_-]{20,}/g, "<token>");
+}
+
+// One message masks a dozen fields, and loadConfig() rereads .env and repeats
+// its warnings every time, so the setting is read again only when .env changes.
+// The long-running poller still sees an edit without a restart.
+let masking; // [what it was read from, on]
+function maskingOn() {
+  const dir = process.env.HERDR_PLUGIN_CONFIG_DIR;
+  const mtime = (dir && statSync(join(dir, ".env"), { bigint: true, throwIfNoEntry: false })?.mtimeNs) || 0n;
+  const from = `${dir}|${mtime}|${process.env.MASK_SECRETS}`;
+  if (masking?.[0] !== from) masking = [from, isOn(loadConfig()("MASK_SECRETS"))];
+  return masking[1];
+}
+
+// Telegram chats are not end-to-end encrypted, so captured text must not carry
+// recognizable credentials. These shapes are best-effort, not a security guarantee.
+export function maskSecrets(text) {
+  let s = String(text ?? "");
+  if (!maskingOn()) return s;
+
+  // Remove the whole PEM block before matching individual values, since its
+  // body can span many lines and has no identifying prefix of its own.
+  s = s.replace(/-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g, "$1 …[masked]");
+  s = s.replace(
+    /(?<![\w])((["']?)([A-Za-z_][A-Za-z0-9_]*)\2\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s"'`,;})]+))/g,
+    (match, head, _quote, name, double, single, bare) => {
+      const value = double ?? single ?? bare;
+      if (!/SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY/i.test(name) || value.length < 8) return match;
+      const quote = double !== undefined ? '"' : single !== undefined ? "'" : "";
+      return `${head}${quote}…[masked]${quote}`;
+    }
+  );
+
+  // Distinctive prefixes and minimum lengths avoid treating ordinary words,
+  // hashes and short example values as credentials.
+  for (const pattern of [
+    /\b(Bearer[ \t]+)[A-Za-z0-9._~+\/-]{16,}=*(?![A-Za-z0-9._~+\/=-])/gi,
+    /(?<![\w-])(sk-ant-|sk-proj-|sk-)[A-Za-z0-9_-]{20,}(?![\w-])/g,
+    /(?<![\w-])(gh[pousr]_|github_pat_)[A-Za-z0-9_]{36,}(?![\w-])/g,
+    /(?<![\w])(AKIA|ASIA)[A-Z0-9]{16}(?![\w])/g,
+    /(?<![\w-])(xox[abprs]-)[A-Za-z0-9-]{20,}(?![\w-])/g,
+    /(?<![\w-])(AIza)[A-Za-z0-9_-]{35}(?![\w-])/g,
+    /(?<![\w-])(sk_live_|rk_live_|sk_test_)[A-Za-z0-9]{16,}(?![\w-])/g,
+    /(?<!\d)(\d{5,12}:)[A-Za-z0-9_-]{30,}(?![\w-])/g,
+    /(?<![\w-])(eyJ)[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}(?![\w-])/g,
+  ]) s = s.replace(pattern, "$1…[masked]");
+  return s;
+}
+
+// Herdr's server may not have the interactive shell's PATH, so prefer the
+// binary path it injects and fall back to the usual install locations.
+export function herdrBin() {
+  const candidates = [
+    process.env.HERDR_BIN_PATH,
+    join(homedir(), ".local", "bin", "herdr"),
+    "/usr/local/bin/herdr",
+    "/usr/bin/herdr",
+    "/opt/homebrew/bin/herdr",
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return "herdr";
+}
+
+// The speech-to-text a voice message needs, when this machine has one: the
+// openai-whisper CLI or whisper-ctranslate2, which takes the same arguments.
+// Looked for on PATH and in ~/.local/bin, where pipx and uv put them — Herdr's
+// server may not have the shell's PATH. Nothing is installed for it: without
+// one a voice message is refused with a line saying so. WHISPER_BIN names it
+// outright, and one named but missing is missing, not a cue to look elsewhere.
+const WHISPER_NAMES = ["whisper-ctranslate2", "whisper"];
+
+export function whisperBin(named = process.env.WHISPER_BIN) {
+  if (named) return existsSync(named) ? named : undefined;
+  const dirs = [...String(process.env.PATH ?? "").split(":"), join(homedir(), ".local", "bin"), "/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"];
+  for (const name of WHISPER_NAMES) {
+    for (const dir of dirs) {
+      if (dir && existsSync(join(dir, name))) return join(dir, name);
+    }
+  }
+  return undefined;
+}
+
+// Herdr's server may not have the shell's PATH, the same way it does not have
+// node's, so git gets the same treatment. Notifications and reply commands use
+// the binary the doctor checks, rather than guessing separately.
+export function gitBin() {
+  const candidates = [process.env.GIT_BIN_PATH, "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return "git";
+}
+
+function git(cwd, args, machine) {
+  if (typeof cwd !== "string" || !cwd || cwd.includes("\0")) return undefined;
+  // The folder of a remote agent is not on this disk, so hc runs git on that
+  // machine. The output arrives whole; locally it is streamed below.
+  if (machine) {
+    const res = hcRun(
+      ["exec", "--on", machine, "--cwd", cwd, "--env", "GIT_OPTIONAL_LOCKS=0", "--env", "LC_ALL=C", "git", ...args],
+      10_000
+    );
+    return res.ok ? res.out : undefined;
+  }
+  // ponytail: filename inventories are bounded at 1 MB; stream them if huge
+  // untracked trees matter.
+  const res = spawnSync(gitBin(), ["-C", cwd, ...args], {
+    encoding: "utf8",
+    timeout: 3000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" },
+  });
+  if (res.error || res.status !== 0) return undefined;
+  return res.stdout;
+}
+
+// Not every change need be this turn's doing, but this is the difference between
+// an agent that thought about the problem and one that changed things. Share the
+// counts with /diff so its caption and the notification's line use the same rules.
+export function workingTreeChanges(cwd, showNames = false, machine) {
+  const stat = git(cwd, ["diff", "--shortstat", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], machine);
+  if (stat === undefined) return undefined;
+  const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], machine);
+  if (untracked === undefined) return undefined;
+
+  const bits = [];
+  const files = /(\d+) files? changed/.exec(stat);
+  const added = /(\d+) insertions?\(\+\)/.exec(stat);
+  const removed = /(\d+) deletions?\(-\)/.exec(stat);
+  if (files) bits.push(`${files[1]} ${files[1] === "1" ? "file" : "files"}`);
+  if (added || removed) bits.push(`+${added?.[1] ?? 0} −${removed?.[1] ?? 0}`);
+
+  // NUL separators count filenames with newlines correctly without quoting or
+  // mistaking a piece of one name for another file.
+  const newFiles = untracked.split("\0").filter(Boolean);
+  if (newFiles.length) bits.push(`${newFiles.length} new${showNames ? `: ${newFiles.join(", ")}` : ""}`);
+  return bits.join(" · ");
+}
+
+export const DIFF_MAX_BYTES = 5 * 1024 * 1024;
+
+export async function workingTreeDiff(cwd, machine) {
+  if (git(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], machine) === undefined) {
+    return { error: "The directory is not a git repo, or it has no commits yet." };
+  }
+  const summary = workingTreeChanges(cwd, true, machine);
+  if (summary === undefined) return { error: "I could not read the working tree changes." };
+
+  // A remote diff comes back through hc in one piece, so it is only kept under
+  // the same limit; the local one is streamed and never held whole.
+  if (machine) {
+    const text = git(cwd, ["diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], machine);
+    if (text === undefined) return { error: "I could not read the diff (git failed or timed out)." };
+    const bytes = Buffer.byteLength(text);
+    return { summary, bytes, text: bytes <= DIFF_MAX_BYTES ? text : undefined };
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn(gitBin(), ["-C", cwd, "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], {
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+    });
+    const chunks = [];
+    let bytes = 0;
+    // Count the whole diff, but stop keeping it after the limit so a large
+    // working tree cannot exhaust the poller's memory just to report its size.
+    child.stdout?.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes <= DIFF_MAX_BYTES) chunks.push(chunk);
+      else chunks.length = 0;
+    });
+    child.on("error", () => resolve({ error: "I could not run git to read the diff." }));
+    child.on("close", (code) => resolve(code === 0
+      ? { summary, bytes, text: bytes <= DIFF_MAX_BYTES ? Buffer.concat(chunks).toString("utf8") : undefined }
+      : { error: "I could not read the diff (git failed or timed out)." }));
+  });
+}
+
+// One agent as it stands now, in `herdr agent get`'s shape, from whichever
+// runtime this runs under.
+export function liveAgentRecord(paneId) {
+  if (isCore()) return coreAgent(paneId, coreMachines(loadConfig()("CORE_MACHINES")));
+  try {
+    return JSON.parse(herdr(["agent", "get", paneId]))?.result?.agent;
+  } catch {
+    return undefined;
+  }
+}
+
+// The command that gets you to a pane, as the notification shows it.
+export function focusHint(paneId) {
+  return isCore() ? `hc attach ${paneId}` : `herdr agent focus ${paneId}`;
+}
+
+// A note in Herdr's own notification area. herdr-core draws nothing, so there
+// it is a line in the log, which is where a service's output goes anyway.
+export function showNotification(title, body) {
+  console.log(`herdr-telegram-notify: ${title}${body ? ` — ${body}` : ""}`);
+  if (isCore()) return;
+  spawnSync(herdrBin(), ["notification", "show", title, ...(body ? ["--body", body] : []), "--sound", "none"], {
+    encoding: "utf8",
+    timeout: 4000,
+  });
+}
+
+export function herdr(args, timeout = 4000) {
+  const res = spawnSync(herdrBin(), args, {
+    encoding: "utf8",
+    timeout,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (res.error || res.status !== 0) return undefined;
+  return res.stdout;
+}
+
+// Every workspace, pane and agent herdr knows about. The notifier and the
+// poller's /status both need it, so it lives here rather than in either.
+export function loadSnapshot() {
+  if (isCore()) return loadCoreSnapshot(process.env.HERDR_PLUGIN_STATE_DIR, coreMachines(loadConfig()("CORE_MACHINES")));
+  const out = herdr(["api", "snapshot"]);
+  if (!out) return undefined;
+  try {
+    return JSON.parse(out).result?.snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
+// -------------------------------------------------------- sidebar metadata
+
+export const SIDEBAR_PHONE_TTL_MS = 30 * 60 * 1000;
+export const SIDEBAR_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const sidebarExec = promisify(execFile);
+let sidebarSeq = 0n;
+
+// Epoch nanoseconds survive a new hook process, unlike a counter starting at
+// zero. Advance local ties as well; Herdr accepts uint64, not JavaScript numbers.
+export function sidebarSequence() {
+  const now = BigInt(Math.round(performance.timeOrigin * 1_000_000)) + BigInt(Math.round(performance.now() * 1_000_000));
+  sidebarSeq = now > sidebarSeq ? now : sidebarSeq + 1n;
+  return sidebarSeq.toString();
+}
+
+// Values are display-only. Never await this on a delivery path: a missing or
+// older Herdr must not hold up a notification, a reply or a mute confirmation.
+export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, seq, cfg = loadConfig() } = {}) {
+  if (!isOn(cfg("SIDEBAR_TOKENS")) || isOn(cfg("DRY_RUN")) || (scope === "pane" && !id)) return;
+  // herdr-core has no sidebar tokens: the app draws its own from terminal
+  // labels, so a pane is one terminal and the mute (a workspace's) goes on every
+  // agent under its own label, which leaves a pane's badge where it is.
+  if (isCore()) {
+    const key = scope === "pane" ? "telegram" : "telegram.mute";
+    const expires = expiresAt ?? (ttlMs === undefined ? undefined : Date.now() + ttlMs);
+    const clear = value === undefined || (expires !== undefined && expires <= Date.now());
+    const labels = clear
+      ? [`${key}=`, `${key}.expires=`]
+      : [`${key}=${value}`, ...(expires === undefined ? [] : [`${key}.expires=${expires}`])];
+    const targets = scope === "pane" ? [id] : (loadSnapshot()?.agents ?? []).map((agent) => agent.pane_id);
+    let failure;
+    try {
+      // hc runs synchronously; one tick later keeps a delivery already on its way.
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const target of targets) {
+        const res = hcRun(["label", target, ...labels], 1000);
+        // One terminal that closed between the snapshot and the label must not
+        // keep the rest of the mute from landing.
+        if (!res.ok) failure ??= res.why;
+      }
+      if (failure) throw new Error(failure);
+    } catch (err) {
+      if (isOn(cfg("DEBUG"))) console.error(`herdr-telegram-notify: sidebar token report failed: ${redact(err.message, cfg("TELEGRAM_BOT_TOKEN"))}`);
+    }
+    return;
+  }
+  // Capture the sequence before the snapshot or RPC can be delayed.
+  const sequence = seq ?? sidebarSequence();
+  const run = (args) => sidebarExec(herdrBin(), args, {
+    encoding: "utf8", timeout: 1000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+  });
+  try {
+    const ids = id ? [id] : (JSON.parse((await run(["api", "snapshot"])).stdout).result?.snapshot?.workspaces ?? [])
+      .map((workspace) => workspace.workspace_id).filter(Boolean);
+    await Promise.all(ids.map((target) => {
+      // Compute remaining time after the snapshot, not before it. Herdr caps
+      // TTL at one day; a longer mute still keeps its full notification silence.
+      const remaining = expiresAt === undefined ? ttlMs : expiresAt - Date.now();
+      const clear = value === undefined || (expiresAt !== undefined && remaining <= 0);
+      const args = [scope, "report-metadata", target, "--source", "naturalmoods.herdr-telegram-notify",
+        ...(clear ? ["--clear-token", "telegram"] : ["--token", `telegram=${value}`]), "--seq", String(sequence)];
+      if (!clear && remaining !== undefined) args.push("--ttl-ms", String(Math.max(1, Math.min(SIDEBAR_TTL_MAX_MS, Math.floor(remaining)))));
+      return run(args);
+    }));
+  } catch (err) {
+    if (isOn(cfg("DEBUG"))) console.error(`herdr-telegram-notify: sidebar token report failed: ${redact(err.message, cfg("TELEGRAM_BOT_TOKEN"))}`);
+  }
+}
+
+// ------------------------------------------------ formatting the message
+
+const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤", error: "❌" };
+
+export function statusEmoji(status) {
+  return STATUS_EMOJI[status] ?? "🔔";
+}
+
+export const TELEGRAM_LIMIT = 4096;
+
+// Longest a single head line may be before it is clipped; see buildMessage().
+export const HEAD_LINE_CHARS = 300;
+
+// Past this the quote is sent collapsed, with Telegram's own "show more" on it.
+// Below it, collapsing costs a tap and saves nothing.
+export const EXPANDABLE_QUOTE_CHARS = 300;
+
+// Undefined when the list is empty — "nothing said", which is not the same
+// answer as "said no".
+export function listMatches(list, ...values) {
+  const wanted = String(list ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!wanted.length) return undefined;
+  return values.some((v) => v !== undefined && wanted.includes(String(v).toLowerCase()));
+}
+
+// `storefront:12,wB:15` — which topic of a forum group a workspace's messages
+// belong in. Falls back to TELEGRAM_TOPIC_ID, and to the group's General topic
+// when neither names one.
+export function topicFor(cfg, label, id) {
+  for (const pair of String(cfg("TELEGRAM_TOPICS") ?? "").split(",")) {
+    const at = pair.lastIndexOf(":");
+    if (at === -1) continue;
+    if (listMatches(pair.slice(0, at), label, id)) return toInt(pair.slice(at + 1), undefined);
+  }
+  return toInt(cfg("TELEGRAM_TOPIC_ID"), undefined);
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function escapeHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Agents write Markdown; Telegram wants tags. Run this after escapeHtml — the
+// markers it looks for survive escaping untouched.
+export function inlineMarkdown(escaped) {
+  return escaped
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+}
+
+export function stripEmphasis(text) {
+  return text.replace(/\*\*([^*\n]+)\*\*/g, "$1");
+}
+
+export function tilde(path) {
+  const home = homedir();
+  return path && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+}
+
+export function humanDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  if (minutes < 60) return restSeconds ? `${minutes}m ${restSeconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
+}
+
+export function humanTokens(n) {
+  if (n < 1000) return String(n);
+  if (n < 1000000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, "")}k`;
+  return `${(n / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+// "23:00-07:00", a window that may run past midnight. Anything unparseable is
+// read as no window at all: a typo should cost you a silent night, not silence
+// every notification you have.
+export function parseQuietHours(spec) {
+  const match = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(String(spec ?? ""));
+  if (!match) return undefined;
+  const [fromH, fromM, toH, toM] = match.slice(1).map(Number);
+  if (fromH > 23 || toH > 23 || fromM > 59 || toM > 59) return undefined;
+  const from = fromH * 60 + fromM;
+  const to = toH * 60 + toM;
+  return from === to ? undefined : { from, to };
+}
+
+export function inQuietHours(spec, now = new Date()) {
+  const window = parseQuietHours(spec);
+  if (!window) return false;
+  const { from, to } = window;
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
+}
+
+// A turn that cost four tenths of a cent is the common case, and `$0.00` says
+// nothing about it — so the precision follows the number down. Two decimals
+// above a dime, because money written `$1.2` reads like a typo.
+export function humanCost(cost) {
+  if (cost >= 0.1) return `$${cost.toFixed(2)}`;
+  if (cost < 0.0005) return "<$0.001";
+  return `$${cost.toFixed(cost >= 0.01 ? 3 : 4).replace(/0+$/, "")}`;
+}
+
+export function clockTime(date) {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+export function truncate(text, max) {
+  const collapsed = text.replace(/\n{3,}/g, "\n\n").trim();
+  if (collapsed.length <= max) return collapsed;
+  return `${collapsed.slice(0, max).replace(/\s+\S*$/, "")} …`;
+}
+
+// What the person actually typed, out of a record that also carries whatever the
+// harness wrapped around it.
+export function promptText(raw) {
+  const text = String(raw ?? "");
+  // A slash command arrives as a wrapper around its name; the name is the ask.
+  const command = /<command-name>([^<]+)<\/command-name>/.exec(text);
+  if (command) return command[1].trim();
+  // A background task finishing starts a turn of its own, written as a user
+  // record; its summary says what woke the agent, the XML around it nothing.
+  const task = /<task-notification>[\s\S]*?<summary>([^<]+)<\/summary>/.exec(text);
+  if (task) return `↻ ${task[1].trim()}`;
+  return text
+    .replace(/<(system-reminder|task-notification|local-command-[a-z]+|command-[a-z]+)>[\s\S]*?<\/\1>/g, "")
+    .trim();
+}
+
+// The shape of the work: what it reached for, and how often. The busiest four
+// carry it — a list of every tool a long turn touched is a paragraph, not a line.
+export function toolSummary(tools) {
+  if (!tools?.size) return undefined;
+  const ranked = [...tools.entries()].sort((a, b) => b[1] - a[1]);
+  const shown = ranked.slice(0, 4).map(([name, n]) => `${n} ${name}`);
+  const rest = ranked.slice(4).reduce((sum, [, n]) => sum + n, 0);
+  if (rest) shown.push(`+${rest} more`);
+  return shown.join(" · ");
+}
+
+// A head line is short by nature, but nothing promises it: a pane title is
+// whatever the terminal last set it to. Clipping the source — before escaping,
+// so no entity is ever cut in half — keeps the whole head well inside the limit,
+// which leaves the budget below to be spent entirely on the body.
+export function clip(text, max) {
+  const s = String(text);
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+// Use the plugins' display strings, not their names. Keep list order and avoid
+// repeats when an exact name and a wildcard select the same token.
+export function agentTokensLine(tokens, selectors) {
+  const keys = Object.keys(tokens ?? {}).filter((name) => name !== "telegram").sort();
+  const selected = new Set();
+  for (const pattern of String(selectors ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    for (const name of keys) {
+      if (pattern.endsWith("*") ? name.startsWith(pattern.slice(0, -1)) : name === pattern) selected.add(name);
+    }
+  }
+  const values = [...selected].map((name) => tokens[name])
+    .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim());
+  // Mask complete values before flattening or clipping, so a long credential
+  // or a multiline private key cannot turn into an unrecognizable fragment.
+  return values.length ? clip(`📊 ${maskSecrets(values.join(" · ")).replace(/\s+/g, " ")}`, 200) : undefined;
+}
+
+export function buildMessage(parts) {
+  // Mask source fields before clipping or escaping, including messages queued
+  // before masking was enabled and titles shared by notifications and reminders.
+  parts = Object.fromEntries(Object.entries(parts).map(([key, value]) => [key, typeof value === "string" ? maskSecrets(value) : value]));
+  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd, bodyIsScreen, late } = parts;
+
+  const render = (body) => {
+    const plain = [];
+    const html = [];
+    if (late) {
+      plain.push(late);
+      html.push(escapeHtml(late));
+    }
+    plain.push(`${emoji} ${clip(agent, 60)} · ${clip(statusLabel, 60)}`);
+    html.push(`${emoji} <b>${escapeHtml(clip(agent, 60))} · ${escapeHtml(clip(statusLabel, 60))}</b>`);
+
+    if (title) {
+      const shown = clip(title, HEAD_LINE_CHARS);
+      plain.push(shown);
+      html.push(`<i>${escapeHtml(shown)}</i>`);
+    }
+    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+      const shown = clip(line, HEAD_LINE_CHARS);
+      plain.push(shown);
+      html.push(escapeHtml(shown));
+    }
+    if (body) {
+      plain.push("", bodyIsScreen ? body : stripEmphasis(body));
+      html.push(
+        "",
+        bodyIsScreen
+          ? `<pre>${escapeHtml(body)}</pre>`
+          : `<blockquote${body.length > EXPANDABLE_QUOTE_CHARS ? " expandable" : ""}>${inlineMarkdown(
+              escapeHtml(body)
+            )}</blockquote>`
+      );
+    }
+    return { plain: plain.join("\n"), html: html.join("\n") };
+  };
+
+  // Escaping turns one character into as many as six and the body is wrapped in
+  // tags, so the body's own length says little about the message's. Shrink the
+  // source and render again until it fits: cutting the finished HTML to length
+  // instead would leave a half-written tag behind, and Telegram rejects the
+  // whole message over it — every long message arrived stripped of its markup.
+  let body = parts.body;
+  let message = render(body);
+  while (body && (message.html.length > TELEGRAM_LIMIT || message.plain.length > TELEGRAM_LIMIT)) {
+    // Scale rather than subtract: a body of `<` renders four characters for
+    // every one it holds, and taking the overshoot off the source directly
+    // would cut the whole body away in a single step.
+    const rendered = Math.max(message.html.length, message.plain.length);
+    const room = Math.min(Math.floor((body.length * TELEGRAM_LIMIT) / rendered), body.length - 32);
+    body = room > 0 ? truncate(body, room) : undefined;
+    message = render(body);
+  }
+  return message;
+}
+
+// Where every Telegram call goes. Overridable so a test can point a real run at
+// a local stub; nothing in normal use sets it.
+export const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
+
+// One Telegram Bot API call, for the notifier, the poller and the doctor alike.
+// Never throws: a request that never landed comes back as status 0 with the
+// reason, redacted, since the token is in the URL any fetch error quotes. The
+// raw text is kept beside the parsed body for the caller that logs it.
+export async function telegramCall(token, method, payload, timeoutMs) {
+  // A document is multipart, and fetch writes that header itself — it carries a
+  // boundary only it knows. Everything else is JSON.
+  const form = payload instanceof FormData;
+  try {
+    const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
+      method: "POST",
+      ...(form ? {} : { headers: { "content-type": "application/json" } }),
+      body: form ? payload : JSON.stringify(payload ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text().catch(() => "");
+    let json = {};
+    try {
+      json = JSON.parse(text) ?? {};
+    } catch {}
+    return { status: res.status, text, json };
+  } catch (err) {
+    const description = redact(err?.message ?? err, token);
+    return { status: 0, text: description, json: { ok: false, description } };
+  }
+}
+
+// Worth another go: a connection that never landed (status 0), a rate limit, or
+// a server-side error. A 400 is the markup, handled on its own below; 401, 403
+// and 404 are the token or the chat id, and no amount of retrying fixes those.
+export function isRetryable(status) {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+// Longest a rate limit may park a send for, whatever Telegram asks.
+const MAX_RETRY_AFTER = 30 * 1000;
+
+// Telegram says how long to wait when it rate-limits; honour it, within reason.
+export function retryAfterMs(body) {
+  try {
+    const seconds = JSON.parse(body)?.parameters?.retry_after;
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, MAX_RETRY_AFTER);
+  } catch {}
+  return undefined;
+}
+
+// ------------------------------------------------------ reading a screen
+
+// A panel's left edge is what gives a split screen away: every one of its lines
+// begins in the same column, with a margin in front of it. Prose starts its words
+// wherever they fall, so nothing in a single column comes close to these.
+const MIN_ROWS_FOR_COLUMNS = 6;
+const MIN_BOUNDARY_COLUMN = 24; // below this it is indentation, not a panel
+const BOUNDARY_EDGE_SHARE = 0.4; // rows beginning a run in exactly this column
+const BOUNDARY_MARGIN_BLANK = 0.8; // with the column before it blank
+
+// Both sides then have to be lived in: one deep indent among ordinary lines can
+// look like an edge, and its near-empty other half gives it away.
+const MIN_BLOCK_OCCUPANCY = 0.25;
+
+// What a question looks like when an agent is waiting on one.
+const PROMPT_MARKER = /(^|\s)❯|^\s*\d+\.\s+(yes|no)\b|\bdo you want\b|\bwould you like\b|\(y\/n\)/i;
+
+// The character ranges a screen's rows divide into, or nothing at all when it is
+// the ordinary single column. Looking for a blank gutter does not work: a panel
+// wraps its text to its own full width, so the space between the two is often a
+// single column and sometimes none.
+export function screenColumns(rows) {
+  const filled = rows.filter((row) => row.trim());
+  if (filled.length < MIN_ROWS_FOR_COLUMNS) return [];
+  const width = Math.max(...filled.map((row) => row.length));
+
+  const boundaries = [];
+  for (let col = MIN_BOUNDARY_COLUMN; col < width; col += 1) {
+    let starts = 0;
+    let margin = 0;
+    for (const row of filled) {
+      const here = col < row.length ? row[col] : " ";
+      const before = col - 1 < row.length ? row[col - 1] : " ";
+      if (before === " ") {
+        margin += 1;
+        if (here !== " ") starts += 1;
+      }
+    }
+    if (starts / filled.length >= BOUNDARY_EDGE_SHARE && margin / filled.length >= BOUNDARY_MARGIN_BLANK) {
+      boundaries.push(col);
+    }
+  }
+  if (!boundaries.length) return [];
+
+  const cuts = [0, ...boundaries, width];
+  const blocks = cuts.slice(0, -1).map((from, i) => [from, cuts[i + 1]]);
+  const lived = blocks.filter(
+    ([from, to]) =>
+      filled.filter((row) => row.slice(from, to).trim()).length / filled.length >= MIN_BLOCK_OCCUPANCY
+  );
+  return lived.length >= 2 ? lived : [];
+}
+
+// A pane can be showing two things at once — an agent's transcript with a diff
+// panel beside it — and then every row of the screen holds a piece of each. Read
+// as lines they interleave into a paragraph that reads as neither, so one column
+// is kept and the rest of each row dropped. The question the agent is waiting on
+// decides which; failing that the widest, on the grounds that the main view is
+// what the pane gave the room to.
+export function cropScreen(rows) {
+  const blocks = screenColumns(rows);
+  if (blocks.length < 2) return rows;
+
+  const sliced = ([from, to]) => rows.map((row) => row.slice(from, to));
+  const asking = blocks.find((block) => sliced(block).some((line) => PROMPT_MARKER.test(line)));
+  const chosen = asking ?? blocks.reduce((a, b) => (b[1] - b[0] > a[1] - a[0] ? b : a));
+  return sliced(chosen);
+}
+
+// The current screen can show work that has not reached the transcript yet,
+// or a blocked agent's question that may never appear there.
+export function screenTail(paneId, maxLines) {
+  // More rows than will be shown: finding the column boundary is a question
+  // about the shape of the whole screen, and a handful of rows cannot answer it.
+  const rows = Math.max(maxLines * 2, 24);
+  const out = isCore()
+    ? hcJson(["read", "--lines", String(rows), paneId])?.text
+    : herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
+  if (!out) return undefined;
+
+  // Escapes and box drawing go first and column positions are kept: a vertical
+  // rule between two columns has to read as blank space before the gutter it
+  // sits in can be seen at all.
+  const screen = out
+    .split("\n")
+    .map((line) => line.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/[─-╿▀-▟]/g, " ").replace(/\s+$/, ""));
+
+  const lines = cropScreen(screen)
+    // Only now: with one column in hand, the runs of spaces left in a row are
+    // its own alignment rather than the wall between it and the next column.
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    // Drop separators and the agent's own chrome: the empty input prompt and
+    // the shortcut hint line under it carry nothing worth a notification.
+    .filter((line) => line && !/^[·•\-–—_=.]+$/.test(line) && !/^[❯>]$/.test(line) && !/^⏵/.test(line));
+  // Mask before dropping older lines, so a PEM block is removed while both its
+  // opening and closing markers are still in the captured screen.
+  const tail = maskSecrets(lines.join("\n")).split("\n").slice(-maxLines).join("\n");
+  return tail || undefined;
+}
+
+// A menu on a blocked agent's screen: numbered choices from 1 up, one of them
+// marked as the current selection. The marker is what tells a menu from a
+// numbered list in the agent's prose, which a button would turn into an answer
+// to a question nobody asked. The last menu on screen wins, since the question
+// is at the bottom.
+const OPTION_LINE = /^([❯›>▶→]\s*)?(\d{1,2})[.)]\s+(\S.*)$/;
+
+export function screenOptions(screen) {
+  let options = [];
+  let marked = false;
+  for (const line of String(screen ?? "").split("\n")) {
+    const match = OPTION_LINE.exec(line.trim());
+    if (!match) continue;
+    if (match[2] === "1") {
+      options = [];
+      marked = false;
+    }
+    if (Number(match[2]) !== options.length + 1) continue;
+    options.push({ n: match[2], label: match[3] });
+    marked ||= Boolean(match[1]);
+  }
+  return marked && options.length >= 2 ? options : [];
+}
+
+// ---------------------------------------------------------------- locking
+
+// Several copies of this plugin run at once by design: one hook process per
+// status change, plus the sweeper and the reply poller, all writing one state
+// directory. Exclusion between them is the kernel's, through flock(2): a lock
+// held by a process that dies — crash, kill -9, the machine going down — is
+// released by the kernel when the file descriptor closes. There is no stale
+// lock to detect, no pid to believe, and no reclaim protocol to get subtly
+// wrong. That is the whole reason for it.
+//
+// Node has no flock binding, so the lock is held by a small shell child:
+//
+//   sh -c 'exec 9>"$1"; "$2" -w N 9 || { echo no > "$0"; exit 3; }
+//          echo $$ > "$0"; read ignored'  <ready> <lockfile> <flock>
+//
+// It reports through the ready file whether it got the lock, then blocks
+// reading a pipe this process holds open. Releasing closes that pipe; if this
+// process dies without releasing, the pipe closes anyway and the kernel drops
+// the lock with it. One extra process per lock, which is the price of a lock
+// that cannot outlive its owner.
+//
+// This needs util-linux or a compatible macOS flock(1) — `doctor` checks for
+// it and says what stops working without it. Without it nothing here touches
+// shared state at all: the queue, the message map and the background processes
+// stop, the notification itself does not.
+
+const FLOCK_CANDIDATES = [
+  "/usr/bin/flock",
+  "/bin/flock",
+  "/usr/local/bin/flock",
+  "/opt/homebrew/opt/util-linux/bin/flock",
+  "/usr/local/opt/util-linux/bin/flock",
+  "/opt/homebrew/bin/flock",
+];
+
+// How long a short critical section may wait for another process's, and how
+// much longer than that to wait for the child to say which way it went.
+const LOCK_WAIT_SECONDS = 10;
+const LOCK_START_GRACE_MS = 5000;
+const RELEASE_WAIT_MS = 1000;
+
+// FLOCK_BIN_PATH names it outright, the way HERDR_BIN_PATH does. Pointed
+// somewhere that is not there, the answer is "no flock" rather than one of the
+// usual paths: an override that silently falls back to something else is how
+// you end up testing the wrong binary.
+export function flockBin() {
+  const named = process.env.FLOCK_BIN_PATH;
+  if (named) return existsSync(named) ? named : undefined;
+  for (const candidate of FLOCK_CANDIDATES) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function flockAvailable() {
+  return Boolean(flockBin());
+}
+
+// Everything here is synchronous — the callers are file readers and writers —
+// so waiting cannot be done with a timer.
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Take the lock, or return undefined. `waitSeconds` 0 asks the kernel for it
+// without waiting, which is what the "is anyone already doing this?" callers
+// want; anything higher waits that long for the holder to finish.
+export function holdFlock(path, { waitSeconds = 0 } = {}) {
+  const bin = flockBin();
+  if (!bin) return undefined;
+  const ready = `${path}.${process.pid}.${randomUUID()}.ready`;
+  let child;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    child = spawn(
+      "/bin/sh",
+      [
+        "-c",
+        'exec 9>"$1" || { echo no > "$0"; exit 3; }; ' +
+          `"$2" ${waitSeconds > 0 ? `-w ${waitSeconds}` : "-n"} 9 || { echo no > "$0"; exit 3; }; ` +
+          'echo "$$" > "$0"; read ignored',
+        ready,
+        path,
+        bin,
+      ],
+      { stdio: ["pipe", "ignore", "ignore"] }
+    );
+    // Neither the child nor the pipe may keep this process alive: the pipe
+    // closing is exactly how the lock is released when we go.
+    child.unref();
+    child.stdin.unref?.();
+  } catch {
+    return undefined;
+  }
+
+  // The child writes its pid on success and `no` on failure, either way within
+  // waitSeconds. Past that something is wrong with the child rather than with
+  // the lock, and giving up is the same answer as being refused.
+  const deadline = Date.now() + waitSeconds * 1000 + LOCK_START_GRACE_MS;
+  for (;;) {
+    let marker;
+    try {
+      marker = readFileSync(ready, "utf8").trim();
+    } catch {}
+    if (marker) {
+      try {
+        unlinkSync(ready);
+      } catch {}
+      if (marker === "no") {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        return undefined;
+      }
+      const release = () => {
+        try {
+          child.stdin.end();
+        } catch {}
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        // The kernel frees the lock when the child actually dies, which is a
+        // moment after the signal rather than at it. Without waiting for that,
+        // release() is a lie: the caller looks again, or asks for the lock
+        // again without waiting, and finds its own lock still held. Bounded,
+        // because a waiter taking it the instant it comes free looks the same
+        // from here and is just as good an answer.
+        const until = Date.now() + RELEASE_WAIT_MS;
+        while (Date.now() < until && flockHeld(path)) sleepSync(2);
+      };
+      release.pid = Number.parseInt(marker, 10);
+      return release;
+    }
+    if (Date.now() > deadline) {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      try {
+        unlinkSync(ready);
+      } catch {}
+      console.error(`herdr-telegram-notify: gave up waiting for the lock on ${path}`);
+      return undefined;
+    }
+    sleepSync(2);
+  }
+}
+
+// Is someone holding it right now? Asked by `doctor`, and by the hook waiting
+// for a background process it just started to take its own lock.
+export function flockHeld(path) {
+  const bin = flockBin();
+  if (!bin || !existsSync(path)) return false;
+  // Herdr may not inherit a shell PATH, so neither the probe nor its no-op
+  // command may depend on it. The option separator protects the shell flags.
+  const res = spawnSync(bin, ["-n", "--", path, "/bin/sh", "-c", ":"], { timeout: 4000 });
+  // Only flock's own refusal is evidence of a holder. A probe that could not
+  // run at all — spawn refused, killed, past the timeout on a loaded machine —
+  // exits with no status, and reading that as "someone holds it" is the
+  // expensive direction to be wrong in: the hook at ensureDaemon() takes it as
+  // "the daemon is already running" and never starts one.
+  if (res.error || res.status === null) return false;
+  return res.status !== 0;
+}
+
+// Thrown rather than swallowed: a caller that cannot get the lock must not
+// carry on and write anyway, and it is the caller that knows what to do with
+// the news.
+export class LockUnavailable extends Error {
+  constructor(path) {
+    super(
+      flockAvailable()
+        ? `could not lock ${path}`
+        : `no flock(1) found, so ${path} cannot be locked — this plugin needs util-linux's flock`
+    );
+    this.path = path;
+  }
+}
+
+// Short critical sections: read a file, change it, write it back. Held for
+// microseconds, so waiting for one is waiting for another process's few
+// syscalls.
+export function withFileLock(path, fn, { waitSeconds = LOCK_WAIT_SECONDS } = {}) {
+  const release = holdFlock(path, { waitSeconds });
+  if (!release) throw new LockUnavailable(path);
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+export function readLines(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line));
+    } catch {}
+  }
+  return entries;
+}
+
+export function writeLines(path, entries) {
+  mkdirSync(dirname(path), { recursive: true });
+  if (!entries.length) {
+    try {
+      unlinkSync(path);
+    } catch {}
+    return;
+  }
+  // These lines hold what an agent said and what was on its screen, so they are
+  // this user's to read. The mode is set on creation, and a file an older
+  // version left behind is narrowed first — before the content goes in, not
+  // after, and if that cannot be done it is not written at all.
+  try {
+    chmodSync(path, 0o600);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
+}
+
+// ------------------------------------------------------- recorded status
+
+// One file per pane, written by the notifier on every status change. The poller
+// reads them too, so the naming lives here rather than in either.
+export function sanitizeKey(raw) {
+  return String(raw).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+export function readState(stateDir, key) {
+  if (!stateDir) return {};
+  try {
+    return JSON.parse(readFileSync(join(stateDir, `state-${key}.json`), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+export function writeState(stateDir, key, state) {
+  if (!stateDir) return;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, `state-${key}.json`), JSON.stringify(state));
+  } catch {}
+}
+
+export function forgetState(stateDir, key) {
+  if (stateDir) rmSync(join(stateDir, `state-${key}.json`), { force: true });
+}
+
+// Which blocked stretch a pane is in: the moment it entered `blocked`, which is
+// a new one every time it leaves and comes back. The screen cannot tell two of
+// those apart — an agent that asks the same question twice draws the same
+// pixels — so this is what keeps a notification answerable only inside the
+// stretch it was sent from.
+export function blockedEpisode(stateDir, paneId) {
+  if (!paneId) return undefined;
+  const state = readState(stateDir, sanitizeKey(paneId));
+  return state?.status === "blocked" && state.updatedAt ? state.updatedAt : undefined;
+}
+
+// ---------------------------------------------------------------- pending
+
+// Messages the network was down for. Kept short and few on purpose: a queue that
+// grows without limit answers a wifi coming back with a wall of notifications,
+// and a `done` from this morning is history rather than news. The notifier
+// keeps the queue and the doctor counts it, so both read the same limits.
+export const PENDING_TTL = 6 * 60 * 60 * 1000;
+export const PENDING_MAX = 20;
+
+// ------------------------------------------------------------------ mute
+
+// One file in the state dir holding the moment the silence ends. The plugin's
+// mute action writes it, the bot's /mute command writes it, the notifier and the
+// doctor read it — so it lives here rather than in whichever wrote it first.
+// Muted messages are dropped rather than queued: you asked not to be told, not
+// to be told all at once in an hour.
+export const MUTE_DEFAULT_MINUTES = 60;
+
+// Longest a mute may run. A week is already "I am on holiday"; past that it is a
+// typo, and a mute nobody remembers setting is worse than a missed message.
+export const MUTE_MAX_MINUTES = 7 * 24 * 60;
+
+export function mutedUntil(stateDir) {
+  if (!stateDir) return 0;
+  try {
+    const until = JSON.parse(readFileSync(join(stateDir, "mute.json"), "utf8"))?.until;
+    return Number.isFinite(until) && until > Date.now() ? until : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Set, not toggled: the caller says what it wants and gets it, so repeating a
+// command is not a coin flip. A falsy `until` clears the mute. Throws rather
+// than swallowing, because a mute you believe in but that was never written is
+// the bad way for this to fail.
+export function setMute(stateDir, until) {
+  const path = join(stateDir, "mute.json");
+  if (!until) return rmSync(path, { force: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path, JSON.stringify({ until }));
+}
+
+// How long `/mute [minutes]` asks for: the argument when there is one, the
+// configured default when there is not. A whole positive number of minutes
+// inside the ceiling, or nothing — `/mute 30min`, `/mute -5` and `/mute 1e9` are
+// typos, and taking a working number out of one would hide it behind a silence
+// nobody chose. Anything past the first argument is a sentence, not a command.
+export function muteMinutes(args, configured) {
+  if (args.length > 1) return undefined;
+  const minutes = args.length ? toInt(args[0], undefined) : toInt(configured, MUTE_DEFAULT_MINUTES);
+  return minutes && minutes <= MUTE_MAX_MINUTES ? minutes : undefined;
+}
+
+// ------------------------------------------------------ replies from the chat
+
+// How many notifications stay answerable, and for how long. A reply to something
+// older than this has no pane left worth guessing at.
+const MESSAGE_MAP_MAX = 300;
+const MESSAGE_MAP_TTL = 24 * 60 * 60 * 1000;
+
+function messageMapPath(stateDir) {
+  return stateDir ? join(stateDir, "messages.jsonl") : undefined;
+}
+
+// The agent session a notification was about, as one comparable string. Herdr
+// reports it as a transcript path or a session id, and the two never mean the
+// same thing, so the kind is part of the key.
+export function sessionKey(session) {
+  return session?.value ? `${session.kind ?? "?"}:${session.value}` : undefined;
+}
+
+// The question a blocked agent is waiting on, as one comparable string: which
+// blocked stretch it is in, and what is on its screen, hashed. The notifier
+// records it with the notification, the poller checks it is still the question
+// being asked before typing an answer into it. Both halves are needed and
+// neither implies the other — a pane can walk on to a different question inside
+// one stretch, and it can come back to an identical question in a later one.
+// A fixed number of lines rather than SCREEN_LINES: the two ends have to crop
+// the same screen the same way, and the config can be edited in between.
+//
+// Nothing here is recorded without the episode, so a pane whose transitions
+// were never recorded is unanswerable rather than answerable by screen alone.
+//
+// ponytail: the whole screen tail is the question's identity, so a pane that
+// redraws anything in those lines refuses the reply it was waiting for. Refusing
+// is the safe half of the trade; narrow it to the prompt block if it fires in
+// practice.
+const QUESTION_LINES = 12;
+
+// Recorded in place of the key when a blocked notification's question cannot be
+// fingerprinted — an unrecorded transition, or a screen that does not read. It
+// matches no question, which is the point: without it the notification is
+// indistinguishable from one about a finished turn, and a reply to it would be
+// delivered as a new turn once the agent walked on.
+export const QUESTION_UNKNOWN = "blocked:unknown";
+
+export function questionOnScreen(stateDir, paneId) {
+  const episode = blockedEpisode(stateDir, paneId);
+  const screen = episode ? screenTail(paneId, QUESTION_LINES) : undefined;
+  return screen ? `${episode}:${createHash("sha256").update(screen).digest("hex").slice(0, 16)}` : undefined;
+}
+
+// Which pane each sent notification was about — which agent session was in it,
+// since the pane alone is a moving target, and which question it was waiting on
+// when it was one, since a session outlives the question too. Written by the
+// notifier, read by the poller.
+export function rememberMessage(stateDir, messageId, paneId, session, question, full, parts) {
+  const path = messageMapPath(stateDir);
+  if (!path || !messageId || !paneId) return;
+  const entry = {
+    id: messageId,
+    paneId,
+    session: sessionKey(session),
+    question,
+    full: full ? String(full) : undefined,
+    // What the message was built from, so it can be rebuilt with a line saying
+    // it has been overtaken — see closeMessages().
+    parts,
+    at: Date.now(),
+  };
+  // Read, add, write: a hook sending live and a sweeper draining a queue can
+  // land here at the same moment, and whoever wrote second would drop the
+  // other's message from the map — a notification in the chat that nobody can
+  // answer. Under the lock that cannot happen; without one this is not done at
+  // all, because a half-written map is worse than a missing entry.
+  try {
+    withFileLock(join(stateDir, "messages.lock"), () => {
+      writeLines(path, [...readMessageMap(stateDir), entry].slice(-MESSAGE_MAP_MAX));
+    });
+  } catch (err) {
+    console.error(
+      `herdr-telegram-notify: message ${messageId} was sent but not recorded, so a reply to it cannot be routed: ${err.message}`
+    );
+  }
+}
+
+// The notifications about a pane that its latest status change or closure has
+// overtaken: the question it was waiting on is gone, or the turn it reported is
+// over and another has begun, or it was seen at the desk. Taken off the open
+// list under the lock, so two hooks never both claim one; the caller edits them.
+// At most once: an edit that fails leaves the message as it was, which is how
+// it looked before this existed.
+export function closeMessages(stateDir, paneId) {
+  const path = messageMapPath(stateDir);
+  if (!path || !paneId) return [];
+  let closed = [];
+  withFileLock(join(stateDir, "messages.lock"), () => {
+    const entries = readMessageMap(stateDir);
+    closed = entries.filter((e) => e.paneId === paneId && e.parts && !e.closed);
+    if (!closed.length) return;
+    for (const e of closed) e.closed = Date.now();
+    writeLines(path, entries);
+  });
+  return closed;
+}
+
+// What an overtaken notification says it became. The status is the pane's new
+// one, or "closed" when it is gone; the notification is a question when it
+// carried one.
+export function resolvedLine(entry, status, at = new Date()) {
+  const when = clockTime(at);
+  if (status === "closed") return `✕ pane closed · ${when}`;
+  if (entry.question) return status === "working" ? `✓ answered · ${when}` : `✓ no longer waiting · ${when}`;
+  if (status === "idle") return `👀 seen at the desk · ${when}`;
+  if (status === "working") return `↷ on to the next turn · ${when}`;
+  return `↷ overtaken · ${when}`;
+}
+
+export function readMessageMap(stateDir) {
+  const path = messageMapPath(stateDir);
+  if (!path) return [];
+  const cutoff = Date.now() - MESSAGE_MAP_TTL;
+  return readLines(path).filter((entry) => entry?.id && entry.paneId && entry.at > cutoff);
+}
+
+// The pane a reply belongs to, with the session that was in it when the
+// notification went out — the caller checks the second against what is running
+// there now.
+export function targetForMessage(stateDir, messageId) {
+  const target = readMessageMap(stateDir).findLast((entry) => entry.id === messageId);
+  // Older saved responses, or ones captured with masking off, need the current
+  // setting too before /full can hand them to Telegram.
+  return target?.full ? { ...target, full: maskSecrets(target.full) } : target;
+}
+
+// Which updates are this plugin's to act on. The chat id is the first security
+// boundary here: a bot's username is public, anyone can write to it, and what
+// arrives goes to an agent's terminal. Only a reply counts, so text can only
+// ever reach the pane whose notification it answers — never one of its choosing.
+//
+// In a group everyone in it is behind that boundary, so an optional allowlist of
+// Telegram user ids narrows it to named people. With one set, a sender that
+// cannot be named is refused: an anonymous admin or a channel post arrives as
+// sender_chat, with either no `from` at all or Telegram's shared
+// GroupAnonymousBot id, so there is no one to check against the list.
+export function usableReply(update, chatId, allowedUserIds) {
+  // A button under a notification is a reply to it that the bot wrote the text
+  // of: the same chat and sender checks, and only a menu number or one of the
+  // BUTTONS commands gets through — callback data is whatever the client sends,
+  // not necessarily what the button said.
+  const query = update?.callback_query;
+  if (query) {
+    const message = query.message;
+    if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
+    if (listMatches(allowedUserIds, query.from?.id) === false) return undefined;
+    const data = String(query.data ?? "");
+    if (!/^\d{1,2}$/.test(data) && !Object.keys(BUTTONS).some((name) => data === `/${name}`)) return undefined;
+    return {
+      text: data,
+      messageId: message.message_id,
+      replyTo: message.message_id,
+      threadId: message.message_thread_id,
+      callbackId: query.id,
+    };
+  }
+  const message = update?.message;
+  if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
+  const allowed = listMatches(allowedUserIds, message.from?.id);
+  if (allowed === false || (allowed !== undefined && message.sender_chat)) return undefined;
+  // A photo or a file carries its words as a caption, not as text.
+  const text = String(message.text ?? message.caption ?? "").trim();
+  const file = attachmentOf(message);
+  if (!text && !file) return undefined;
+  // The topic is carried so the answer goes back to the thread the command was
+  // written in; in a group without topics there is none and Telegram wants none.
+  return {
+    text,
+    messageId: message.message_id,
+    replyTo: message.reply_to_message?.message_id,
+    threadId: message.message_thread_id,
+    ...(file ? { file } : {}),
+  };
+}
+
+// Files an agent can do something with: pictures it can look at, and documents
+// it can read. What is not on the list is refused by name rather than saved.
+export const ATTACHMENT_TYPES = ["jpg", "jpeg", "png", "gif", "webp", "md", "txt", "pdf", "docx"];
+
+// Telegram hands bots files up to this size and no larger.
+export const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+
+// A photo arrives in several sizes, smallest first, and without a name; a
+// document with the name it was sent under — which is the sender's to choose,
+// so only its letters, digits and dots survive, and never a directory.
+export function attachmentOf(message) {
+  // A voice note is not a file to pass on but words to transcribe; see replies.mjs.
+  const voice = message?.voice;
+  if (voice?.file_id) {
+    return { fileId: voice.file_id, name: `voice-${message.message_id}.ogg`, size: voice.file_size, voice: true };
+  }
+  const photo = message?.photo?.at(-1);
+  if (photo?.file_id) {
+    return { fileId: photo.file_id, name: `photo-${message.message_id}.jpg`, size: photo.file_size };
+  }
+  const doc = message?.document;
+  if (!doc?.file_id) return undefined;
+  const base = String(doc.file_name ?? "file").split(/[\\/]/).pop();
+  const safe = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(-80) || "file";
+  return { fileId: doc.file_id, name: `${message.message_id}-${safe}`, size: doc.file_size };
+}
+
+export function attachmentAllowed(name) {
+  const ext = /\.([^.]+)$/.exec(name)?.[1]?.toLowerCase();
+  return Boolean(ext && ATTACHMENT_TYPES.includes(ext));
+}
+
+// How the reply reaches the pane. A blocked agent is sitting at a prompt that
+// wants a keystroke — `herdr agent prompt` refuses it outright with
+// agent_blocked — so the text is typed in and entered. Anything else takes it as
+// a new turn.
+//
+// herdr-core's send pastes and presses Enter in one call, and refuses a blocked
+// program unless forced: forcing it is the same typed-in answer.
+export function replyCommands(paneId, status, text) {
+  // `--`: a reply that starts with a dash is text, not an option.
+  if (isCore()) return [status === "blocked" ? ["send", "--force", "--", paneId, text] : ["send", "--", paneId, text]];
+  if (status === "blocked") {
+    return [
+      ["pane", "send-text", paneId, text],
+      ["pane", "send-keys", paneId, "Enter"],
+    ];
+  }
+  return [["agent", "prompt", paneId, text]];
+}
+
+// The commands the bot takes: the only text that is read as an instruction
+// rather than handed to an agent. A fixed list, so a message that merely begins
+// with a slash runs nothing — what is not on it falls through to the reply path
+// as text.
+// Telegram addresses a command to a named bot when several share a chat, and
+// then only that bot should answer; an unaddressed one is for whoever is
+// listening.
+// Keep the parser and Telegram's menu on the same list, so every command has a
+// description and the menu cannot advertise something this bot does not handle.
+export const COMMANDS = [
+  { command: "status", description: "List agents and what they are doing" },
+  { command: "mute", description: "Mute notifications" },
+  { command: "unmute", description: "Turn notifications back on" },
+  { command: "full", description: "Download the saved response (reply to a notification)" },
+  { command: "stop", description: "Send Esc to the agent (reply to a notification)" },
+  { command: "screen", description: "Show the current screen (reply to a notification)" },
+  { command: "diff", description: "Download uncommitted changes (reply to a notification)" },
+  { command: "new", description: "Start an agent: /new <workspace>[@<branch>] <kind> [prompt]" },
+  { command: "settings", description: "What notifies you now: /settings, or /settings all for every key" },
+  { command: "set", description: "Change a notification setting: /set KEY VALUE" },
+  { command: "unset", description: "Back to the default: /unset KEY" },
+  { command: "only", description: "Notify for these statuses only: /only blocked or /only blocked,done" },
+  { command: "min", description: "Shortest run worth a message: /min done 120, /min blocked off" },
+];
+
+// The reply-to-a-notification commands a notification also carries as buttons,
+// with their labels. A tap is that command sent as a reply to it.
+export const BUTTONS = { full: "📄 full", screen: "🖥 screen", diff: "✎ diff", stop: "⏹ stop" };
+
+export function botCommand(text, botUsername) {
+  const [first = "", ...args] = String(text ?? "").trim().split(/\s+/);
+  const [command, addressed, ...extra] = first.toLowerCase().split("@");
+  if (!COMMANDS.some((entry) => `/${entry.command}` === command)) return undefined;
+  // `mine` says whether to answer it, not whether it is one: a command with a
+  // suffix — another bot's name, this bot's misspelt, or no name at all — is
+  // addressed at a bot either way, and handing it to an agent as text is the one
+  // thing it must not do.
+  const mine = addressed === undefined || (!extra.length && Boolean(botUsername) && addressed === String(botUsername).toLowerCase());
+  return { command, args, mine };
+}
+
+// Most agents one answer names — past this it stops being something you read on
+// a phone, and the count says what was left out.
+const STATUS_AGENTS_MAX = 20;
+const STATUS_ORDER = ["blocked", "error", "working", "done", "idle"];
+
+// The herd on demand: what each agent is, where it is, what it is doing and the
+// pane to reach it in. Blocked first, because the reason to ask is usually
+// whether anyone is waiting on you. With the state directory, each status says
+// when it began — as a clock time, so a pinned copy of this does not go stale
+// between edits the way "12m" would.
+export function herdStatusText(snap, stateDir) {
+  if (!snap) return "I cannot reach herdr right now.";
+  const agents = (snap.agents ?? []).filter((a) => a.pane_id);
+  if (!agents.length) return "No agents are running.";
+
+  const labelOf = (a) =>
+    (snap.workspaces ?? []).find((w) => w.workspace_id === a.workspace_id)?.label ?? a.workspace_id ?? "?";
+  const rank = (a) => {
+    const i = STATUS_ORDER.indexOf(a.agent_status);
+    return i === -1 ? STATUS_ORDER.length : i;
+  };
+
+  const lines = [...agents]
+    .sort((a, b) => rank(a) - rank(b))
+    .slice(0, STATUS_AGENTS_MAX)
+    .map((a) => {
+      const status = String(firstDefined(a.agent_status, "unknown"));
+      const name = clip(String(firstDefined(a.display_agent, a.agent, "agent")), 24);
+      // Only when the recorded status is the one herdr reports: a transition
+      // this plugin never saw would otherwise lend its time to another.
+      const recorded = stateDir ? readState(stateDir, sanitizeKey(a.pane_id)) : {};
+      const since = recorded.status === status && recorded.updatedAt ? ` since ${clockTime(new Date(recorded.updatedAt))}` : "";
+      return `${statusEmoji(status)} ${name} · ${clip(String(labelOf(a)), 32)} · ${status}${since} · ${a.pane_id}`;
+    });
+  const more = agents.length - lines.length;
+  if (more > 0) lines.push(`… and ${more} more`);
+  return lines.join("\n");
+}
+
+// -------------------------------------------------- reading a transcript
+
+// Herdr reports pi's transcript path directly; Claude and Codex report ids.
+// Codex stores dated rollouts, so recent days are searched before old history.
+export function transcriptPath(session) {
+  if (!session?.value) return undefined;
+  // A remote transcript is not a local path: hc brings the text over, and
+  // readTurn() takes it as it is.
+  if (session.machine) {
+    const text = remoteTranscript(session);
+    return text === undefined ? undefined : { text };
+  }
+  if (session.kind === "proc") return guessTranscript(session);
+  if (session.kind === "path") return existsSync(session.value) ? session.value : undefined;
+  if (session.kind !== "id") return undefined;
+  if (session.agent === "codex") {
+    const root = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "sessions");
+    const newestDirs = (path) => readdirSync(path, { withFileTypes: true })
+      .filter((d) => d.isDirectory()).map((d) => d.name).sort().reverse();
+    try {
+      for (const year of newestDirs(root)) {
+        for (const month of newestDirs(join(root, year))) {
+          for (const day of newestDirs(join(root, year, month))) {
+            const dir = join(root, year, month, day);
+            const file = readdirSync(dir).sort().reverse()
+              .find((name) => name.startsWith("rollout-") && name.endsWith(`-${session.value}.jsonl`));
+            if (file) return join(dir, file);
+          }
+        }
+      }
+    } catch {}
+    return undefined;
+  }
+  const projects = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
+  try {
+    for (const dir of readdirSync(projects)) {
+      const candidate = join(projects, dir, `${session.value}.jsonl`);
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+// Transcripts run to megabytes, so only the tail is read — but the tail has to
+// be long enough to reach back past the turn being reported, and an afternoon of
+// tool calls is measured in hundreds of kilobytes.
+export function readTail(path, bytes = 4 * 1024 * 1024) {
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const length = Math.min(size, bytes);
+    const buf = Buffer.alloc(length);
+    readSync(fd, buf, 0, length, size - length);
+    const text = buf.toString("utf8");
+    return size > length ? text.slice(text.indexOf("\n") + 1) : text;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+export function blocksToText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b && b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+// Claude and pi spell the same numbers differently.
+export function usageOf(message) {
+  const u = message?.usage;
+  if (!u) return undefined;
+  const input = u.input_tokens ?? u.input ?? 0;
+  const cacheRead = u.cache_read_input_tokens ?? u.cacheRead ?? 0;
+  const cacheWrite = u.cache_creation_input_tokens ?? u.cacheWrite ?? 0;
+  return {
+    out: u.output_tokens ?? u.output ?? 0,
+    context: input + cacheRead + cacheWrite,
+    cost: u.cost?.total ?? 0,
+  };
+}
+
+// A tool result is also a `user` record; the turn starts at the last one a
+// person actually typed.
+export function isHumanPrompt(record, message) {
+  if (record.isMeta) return false;
+  const content = message.content;
+  if (typeof content === "string") return content.trim().length > 0;
+  if (!Array.isArray(content)) return false;
+  return content.some((b) => b?.type === "text") && !content.some((b) => b?.type === "tool_result");
+}
+
+// One backwards pass over the transcript tail for everything the turn can tell
+// us: what the agent said last, how long the turn took and what it spent.
+// Claude writes `{type:"assistant", message:{…}}`, pi writes
+// `{type:"message", message:{role:"assistant", …}}`, and Codex wraps events
+// and response items in `payload`. Each record chooses its own spelling.
+// maxRecords bounds the walk back to the turn's opening prompt. Set too low it
+// fails silently and expensively: no prompt, no duration, and a token count that
+// only covers the part of the turn it managed to see. A turn of forty tool calls
+// was already past two hundred records.
+export function readTurn(source, maxRecords = 1500) {
+  const tail = typeof source === "string" ? readTail(source) : source?.text;
+  if (!tail) return {};
+  const lines = tail.split("\n").filter((l) => l.trim());
+
+  let text;
+  let prompt;
+  const tools = new Map();
+  let endedAt;
+  let startedAt;
+  let out = 0;
+  let context = 0;
+  let cost = 0;
+  let seen = 0;
+  let codex = false;
+  let codexUsage = false;
+  const codexTotals = new Set();
+
+  for (let i = lines.length - 1; i >= 0 && seen < maxRecords; i--) {
+    let record;
+    try {
+      record = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    seen += 1;
+    if (record.isSidechain) continue; // a subagent's record, not the pane's
+    if (record.type === "event_msg" || record.type === "response_item") {
+      codex = true;
+      const payload = record.payload ?? {};
+      if (record.type === "event_msg") {
+        if (payload.type === "task_complete") {
+          if (!endedAt) {
+            endedAt = record.timestamp;
+            text = blocksToText(payload.last_agent_message) || text;
+          }
+        } else if (payload.type === "task_started") {
+          const start = new Date(typeof payload.started_at === "number" ? payload.started_at * 1000 : record.timestamp);
+          startedAt = Number.isFinite(start.getTime()) ? start.toISOString() : record.timestamp;
+          break;
+        } else if (payload.type === "user_message" && !prompt) {
+          prompt = promptText(blocksToText(payload.message)) || undefined;
+        } else if (payload.type === "item_completed" && payload.item?.type === "UserMessage" && !prompt) {
+          prompt = promptText(blocksToText(payload.item.content)) || undefined;
+        } else if (payload.type === "token_count" && payload.info?.last_token_usage) {
+          const usage = payload.info.last_token_usage;
+          const total = payload.info.total_token_usage?.output_tokens;
+          // Input includes cached tokens already. Totals span earlier turns;
+          // sum this turn's per-call output, without repeated counter updates.
+          if (!codexUsage) context = usage.input_tokens ?? 0;
+          if (total === undefined || !codexTotals.has(total)) out += usage.output_tokens ?? 0;
+          codexTotals.add(total);
+          codexUsage = true;
+        }
+      } else if ((payload.type === "function_call" || payload.type === "custom_tool_call") && payload.name) {
+        tools.set(payload.name, (tools.get(payload.name) ?? 0) + 1);
+      } else if (payload.type === "message" && payload.role === "assistant" && !text) {
+        const content = Array.isArray(payload.content)
+          ? payload.content.map((b) => ({ ...b, type: b?.type === "output_text" ? "text" : b?.type })) : payload.content;
+        text = blocksToText(content) || undefined;
+      }
+      // User-role response items also carry injected context, not a new prompt.
+      continue;
+    }
+    const message = record.message ?? record;
+    const role = message.role ?? record.type;
+
+    if (role === "assistant") {
+      if (!endedAt) endedAt = record.timestamp;
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        // Claude writes `tool_use`, pi writes `toolCall`; the name is in the same
+        // place either way. Counting only Claude's spelling left every pi turn
+        // reporting no tools at all rather than reporting none.
+        if ((block?.type === "tool_use" || block?.type === "toolCall") && block.name) {
+          tools.set(block.name, (tools.get(block.name) ?? 0) + 1);
+        }
+      }
+      const body = blocksToText(message.content);
+      if (!text && body) text = body;
+      const usage = usageOf(message);
+      if (usage) {
+        out += usage.out;
+        context = Math.max(context, usage.context);
+        cost += usage.cost;
+      }
+      continue;
+    }
+    if (role === "user" && isHumanPrompt(record, message)) {
+      startedAt = record.timestamp;
+      prompt = promptText(blocksToText(message.content)) || undefined;
+      break; // start of this turn
+    }
+  }
+
+  // Ran out of records before finding where the turn began — everything measured
+  // from its start is therefore partial.
+  const truncated = seen >= maxRecords && !startedAt;
+  const from = Date.parse(startedAt ?? "");
+  const to = Date.parse(endedAt ?? "");
+  return {
+    // Mask the whole captured text before callers shorten the last message or
+    // prompt, so clipping cannot leave a recognizable key only partly hidden.
+    text: text ? maskSecrets(text) : text,
+    prompt: prompt ? maskSecrets(prompt) : prompt,
+    truncated,
+    tools,
+    startedAt,
+    // Identifies the turn: two panes on one session read the same last record.
+    endedAt,
+    duration: Number.isFinite(from) && Number.isFinite(to) && to > from ? to - from : undefined,
+    out,
+    context,
+    cost: codex ? undefined : cost,
+  };
+}

@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+// Entry point for herdr-plugin.toml's `doctor` action: checks everything the
+// notifier depends on and, if the credentials work, sends one test message. The
+// report goes to stdout, which is where `herdr plugin log list` keeps it, with a
+// one-line verdict in a Herdr notification.
+
+import { existsSync, readFileSync, statSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { hostname } from "node:os";
+import { spawnSync } from "node:child_process";
+
+import { STATUSES_FOR_SUMMARY, statusMinDurationSeconds, sweepIntervalMs } from "./policy.mjs";
+import {
+  DEFAULTS,
+  EXTRA_KEYS,
+  PENDING_TTL,
+  configProblems,
+  flockBin,
+  flockHeld,
+  gitBin,
+  herdr,
+  herdrBin,
+  humanDuration,
+  isCore,
+  loadSnapshot,
+  whisperBin,
+  isOn,
+  loadConfig,
+  mutedUntil,
+  notifyStatuses,
+  readLines,
+  showNotification,
+  telegramCall,
+  toInt,
+} from "./lib.mjs";
+
+import { hasSidebarToken, herdrConfigPath } from "./sidebar.mjs";
+import { hcBin, hcJson } from "./core.mjs";
+
+const results = [];
+const warn = (what, detail) => results.push({ ok: true, warning: true, what, detail });
+const ok = (what, detail) => results.push({ ok: true, what, detail });
+const bad = (what, detail) => results.push({ ok: false, what, detail });
+
+// ------------------------------------------------------------- the machine
+
+const major = Number(process.versions.node.split(".")[0]);
+(major >= 18 ? ok : bad)("Node", `${process.version}${major >= 18 ? "" : " — 18 or newer is required"}`);
+
+if (isCore()) {
+  const status = hcJson(["server", "status"]);
+  if (status?.version) ok("herdr-core", `${hcBin()} ${status.version} answers, core ${status.core?.name ?? "?"}`);
+  else bad("herdr-core", `${hcBin()} did not answer — is the core running on this machine (hc server status)?`);
+  const snap = loadSnapshot();
+  if (snap) ok("daemon", `${snap.agents.length} agent(s) in the daemon's copy of the terminal list`);
+  else bad("daemon", "no terminal list in the state directory — is daemon.mjs running (systemctl --user status herdr-telegram-notify)?");
+} else {
+const snapshot = herdr(["api", "snapshot"]);
+if (snapshot) {
+  let agents = "?";
+  try {
+    agents = (JSON.parse(snapshot).result?.snapshot?.agents ?? []).length;
+  } catch {}
+  ok("herdr", `${herdrBin()} answers, ${agents} agent(s) in the session`);
+} else {
+  bad("herdr", `${herdrBin()} did not answer — the message loses its title, project and herd lines`);
+}
+}
+
+const gitVersion = spawnSync(gitBin(), ["--version"], { encoding: "utf8", timeout: 3000 });
+if (!gitVersion.error && gitVersion.status === 0) ok("git", gitVersion.stdout.trim());
+else bad("git", "not runnable — the ✎ changed-files line will be missing");
+
+// Everything several runs of this plugin share is written under an flock, so
+// that a hook, the sweeper and the poller cannot overwrite each other's queue
+// or start two of each other. Homebrew supplies it on macOS; it is not built in.
+if (flockBin()) {
+  ok("flock", `${flockBin()} — the queue, the message map and the background processes are locked with it`);
+} else {
+  bad(
+    "flock",
+    `not found (${process.platform === "darwin" ? "brew install util-linux" : "util-linux"}) — notifications still send, but nothing is queued or recorded and neither background process starts`
+  );
+}
+
+// -------------------------------------------------------------- the config
+
+const configDir = process.env.HERDR_PLUGIN_CONFIG_DIR;
+const envFile = configDir ? join(configDir, ".env") : undefined;
+if (!configDir) bad(".env", "HERDR_PLUGIN_CONFIG_DIR is not set, so no config file was read");
+else if (!existsSync(envFile)) bad(".env", `${envFile} does not exist`);
+else {
+  const mode = statSync(envFile).mode & 0o777;
+  (mode & 0o077 ? bad : ok)(
+    ".env",
+    `${envFile}, mode ${mode.toString(8)}${mode & 0o077 ? ` — readable by other users; run: chmod 600 ${envFile}` : ""}`
+  );
+}
+
+// Reading the config is itself a check: its own warnings go to stderr from here.
+const cfg = loadConfig();
+const token = cfg("TELEGRAM_BOT_TOKEN");
+const chatId = cfg("TELEGRAM_CHAT_ID");
+(token ? ok : bad)("TELEGRAM_BOT_TOKEN", token ? "set" : "missing — nothing can be sent");
+(chatId ? ok : bad)("TELEGRAM_CHAT_ID", chatId ? String(chatId) : "missing — nothing can be sent");
+
+const known = [...Object.keys(DEFAULTS), ...EXTRA_KEYS];
+const set = known.filter((k) => process.env[k] !== undefined).sort();
+if (set.length) ok("env overrides", `${set.join(", ")} — these beat the .env for this run`);
+
+// A misspelt value is invisible at runtime — nothing fails, the setting simply
+// does not do what it says — so it is the one class of problem a doctor has to
+// find. What it costs differs per key and configProblems says which, because
+// "the default is used instead" is only true of the ones that parse a number:
+// a mistyped status or user id is dropped and the rest of the list goes on.
+// A key that failed here is not reported OK below.
+const broken = new Set();
+for (const { key, detail } of configProblems(cfg)) {
+  broken.add(key);
+  bad(key, detail);
+}
+
+if (!broken.has("MASK_SECRETS")) {
+  ok("MASK_SECRETS", isOn(cfg("MASK_SECRETS")) ? "on — best-effort secret masking before sending" : "off — agent text may contain secrets");
+}
+if (!broken.has("SIDEBAR_TOKENS")) {
+  ok("SIDEBAR_TOKENS", isOn(cfg("SIDEBAR_TOKENS")) ? "on — display-only $telegram sidebar tokens" : "off — no sidebar metadata is reported");
+}
+if (isOn(cfg("SIDEBAR_TOKENS")) && !isCore()) {
+  const path = herdrConfigPath();
+  let configured = false;
+  try { configured = hasSidebarToken(readFileSync(path, "utf8")); } catch {}
+  if (configured) ok("sidebar", `${path} has $telegram in sidebar rows`);
+  else warn("sidebar", `${path} has no readable $telegram sidebar rows; run herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify where the Herdr window runs. A client on another machine needs it in that machine's config.`);
+}
+if (!broken.has("SHOW_AGENT_TOKENS")) {
+  ok("SHOW_AGENT_TOKENS", cfg("SHOW_AGENT_TOKENS") ? `${cfg("SHOW_AGENT_TOKENS")} — agent metadata values, excluding telegram` : "off — no agent metadata line");
+}
+if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${notifyStatuses(cfg).join(",")}`);
+// The floor each status actually has, which is not the key it was written in:
+// blocked inherits none, and the rest fall back to MIN_DURATION_SECONDS. Reading
+// the keys back would show a setting nobody has, not the one in force.
+{
+  const floors = STATUSES_FOR_SUMMARY.map((status) => {
+    const seconds = statusMinDurationSeconds(cfg, status);
+    return `${status} ${seconds ? `${seconds}s` : "off"}`;
+  });
+  if (!STATUSES_FOR_SUMMARY.every((status) => broken.has(`${status.toUpperCase()}_MIN_DURATION_SECONDS`))) {
+    ok("floors", floors.join(" · "));
+  }
+}
+for (const [key, what] of [
+  ["NOTIFY_WORKSPACES", "only these workspaces send"],
+  ["IGNORE_WORKSPACES", "these workspaces never send"],
+  ["QUIET_HOURS", "delivered without a sound in this window"],
+  ["MIN_DURATION_SECONDS", "turns shorter than this are dropped"],
+  ["BLOCKED_DELAY_SECONDS", "blocked notifications wait this many seconds"],
+  ["BLOCKED_REMINDER_MINUTES", "a blocked agent is nudged again after this"],
+  ["BLOCKED_REPEAT_MINUTES", "a blocked agent is reported again this often while it stays blocked"],
+  ["BLOCKED_IGNORE_QUIET_HOURS", "blocked messages are delivered during quiet hours"],
+  ["SWEEP_MINUTES", "the queue and the reminders are swept this often"],
+  ["REPLIES", "a reply in the chat is passed to that agent"],
+  ["BOARD", "a pinned message lists the herd"],
+  ["TELEGRAM_TOPIC_ID", "default forum topic"],
+  ["TELEGRAM_TOPICS", "per-workspace forum topics"],
+]) {
+  const value = cfg(key);
+  if (value && value !== "0" && !broken.has(key)) ok(key, `${value} — ${what}`);
+}
+
+// --------------------------------------------------------------- the state
+
+const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
+if (!stateDir) {
+  bad("state", "HERDR_PLUGIN_STATE_DIR is not set: no de-duplication, no durations, no queue");
+} else {
+  const probe = join(stateDir, "doctor-probe.tmp");
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(probe, "x");
+    unlinkSync(probe);
+    ok("state", stateDir);
+  } catch (err) {
+    bad("state", `${stateDir} is not writable: ${err.message}`);
+  }
+  const until = mutedUntil(stateDir);
+  if (until) bad("muted", `nothing will be sent until ${new Date(until).toLocaleTimeString()}`);
+  // Counted the way the queue itself reads: what has aged out will never be
+  // sent, so it is not waiting on anything.
+  const waiting = readLines(join(stateDir, "pending.jsonl")).filter((e) => e?.parts && e.at > Date.now() - PENDING_TTL).length;
+  if (waiting) bad("queued", `${waiting} message(s) waiting for the network to come back`);
+
+  // The poller is a separate process, so "configured" and "running" are two
+  // different questions and the second is the one that matters.
+  if (isOn(cfg("REPLIES"))) {
+    // Whether the lock is held is the question, and the kernel answers it: a
+    // poller that died is not holding anything, whatever it left on disk.
+    if (flockHeld(join(stateDir, "replies.lock"))) {
+      ok("replies", "poller running — reply to a notification to answer that agent");
+    } else {
+      bad("replies", "REPLIES is on but no poller is running; the next status change starts one");
+    }
+    // Optional, so its absence is not a fault — unless one was named and is not there.
+    const whisper = whisperBin(cfg("WHISPER_BIN"));
+    if (whisper) {
+      const language = cfg("WHISPER_LANGUAGE") || "detected per message";
+      ok("voice", `${whisper} transcribes voice messages (model ${cfg("WHISPER_MODEL")}, language ${language})`);
+    }
+    else if (cfg("WHISPER_BIN")) bad("voice", `WHISPER_BIN is ${cfg("WHISPER_BIN")}, which does not exist; voice messages are refused`);
+    else ok("voice", "no whisper CLI found, so voice messages are refused — pipx install openai-whisper to take them");
+  }
+
+  // Same two questions for the timer that sweeps the queue and the reminders.
+  // Nothing sweeps without somewhere to send to, so an unconfigured machine is
+  // not missing a sweeper — it is missing the two lines above.
+  const sweepMs = sweepIntervalMs(cfg);
+  if (sweepMs && token && chatId) {
+    const why = toInt(cfg("BLOCKED_REPEAT_MINUTES"), 0) ? "the queue, the reminders and the blocked repeats" : "the queue and the reminders";
+    if (flockHeld(join(stateDir, "sweep.lock"))) {
+      ok("sweeper", `running — ${why} are swept every ${humanDuration(sweepMs)}`);
+    } else {
+      bad("sweeper", `SWEEP_MINUTES or BLOCKED_REPEAT_MINUTES asks for a sweep every ${humanDuration(sweepMs)} but nothing is sweeping; the next status change starts it`);
+    }
+  }
+}
+
+// ------------------------------------------------------------- and Telegram
+
+async function callTelegram(method, payload) {
+  const res = await telegramCall(token, method, payload, 8000);
+  return { status: res.status, body: res.json };
+}
+
+if (token && chatId) {
+  const me = await callTelegram("getMe");
+  if (me.body?.ok) ok("bot", `@${me.body.result.username}`);
+  else bad("bot", `getMe says ${me.status}: ${me.body?.description ?? "no answer"}`);
+
+  if (me.body?.ok) {
+    const topic = toInt(cfg("TELEGRAM_TOPIC_ID"), undefined);
+    const sent = await callTelegram("sendMessage", {
+      chat_id: chatId,
+      // Said plainly, because it looks like a notification and is not one: the
+      // doctor sends it directly, so nothing recorded which pane it was about.
+      text: `🩺 herdr-telegram-notify on ${hostname()}: this is the doctor's test message, not a notification — replying to this one has nowhere to go.`,
+      disable_notification: true,
+      ...(topic ? { message_thread_id: topic } : {}),
+    });
+    if (sent.body?.ok) ok("test message", `delivered, message_id ${sent.body.result.message_id}`);
+    else bad("test message", `sendMessage says ${sent.status}: ${sent.body?.description ?? "no answer"}`);
+  }
+}
+
+// ------------------------------------------------------------- the verdict
+
+const problems = results.filter((r) => !r.ok);
+for (const r of results) console.log(`  ${r.warning ? "⚠" : r.ok ? "✓" : "✗"} ${r.what}: ${r.detail}`);
+const title = problems.length ? `🩺 ${problems.length} problem(s)` : "🩺 Telegram notify is healthy";
+const body = problems.length ? problems.map((p) => p.what).join(", ") : "test message sent";
+showNotification(title, body);
+// 2 says the config itself is wrong, which is the one outcome a caller can fix
+// without reading the report; 1 is everything else that failed.
+if (problems.length) process.exitCode = broken.size ? 2 : 1;
