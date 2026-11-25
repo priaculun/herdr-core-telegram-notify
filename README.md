@@ -1,15 +1,15 @@
 # herdr-telegram-notify
 
-Messages you on Telegram when an agent in Herdr finishes or needs input, and
+Sends a Telegram message when an agent in Herdr finishes or needs input, and
 lets you answer that agent from the chat. It runs as a plugin under Herdr TUI,
 and as a small daemon next to herdr-core for the Herdr app.
 
-> **This is a fork.** Everything below is upstream
-> [`naturalmoods/herdr-telegram-notify`](https://github.com/naturalmoods/herdr-telegram-notify)
-> (snapshot recorded in `.upstream-sha`), plus one branch of changes for a
-> deployment that has to know quickly when an agent is stuck. Upstream is the
-> place to send bug reports about anything that is not the additions listed in
-> [What this fork adds](#what-this-fork-adds). MIT, upstream's copyright kept.
+This repository is a fork of
+[naturalmoods/herdr-telegram-notify](https://github.com/naturalmoods/herdr-telegram-notify),
+snapshotted at the commit recorded in `.upstream-sha`. [What this fork
+adds](#what-this-fork-adds) lists the differences and nothing else differs, so a
+bug in the rest belongs in upstream's issue tracker. MIT, upstream's copyright
+kept.
 
 ## Features
 
@@ -24,32 +24,42 @@ and as a small daemon next to herdr-core for the Herdr app.
 
 ## What this fork adds
 
-A notification policy that treats a blocked agent differently from a short turn,
-and lets the phone edit it. Full detail: [docs/guide.md](docs/guide.md#noise-control).
+Upstream has a single duration floor for every status, and every rule lives in
+the `.env`, which you edit by hand. This fork keeps the rules in a policy you can
+edit from the phone, and it stops treating a blocked agent like a turn that
+merely ran short.
 
-- **Per-status floors** — `DONE_`, `BLOCKED_`, `WORKING_`, `IDLE_` and
-  `ERROR_MIN_DURATION_SECONDS`, each its own number. All of them fall back to
-  `MIN_DURATION_SECONDS`; `blocked` inherits none, because an exhausted provider
-  quota looks exactly like a turn that is still thinking and a floor there means
-  finding out hours later.
-- **`BLOCKED_REPEAT_MINUTES`** — a pane that stays blocked is reported again for
-  as long as it stands there, not only at the moment it got stuck.
-  `BLOCKED_IGNORE_QUIET_HOURS=1` lets those repeats through at night.
-- **Settings from the chat** — `/settings`, `/settings all`, `/only blocked`,
-  `/min done 120`, `/set KEY VALUE`, `/unset KEY`. The daemon re-reads the `.env`
-  per event, so nothing needs restarting. The token and chat id are deliberately
-  not writable from there.
-- **The sweeper wakes when a reminder needs it**, not only on `SWEEP_MINUTES`,
-  and never on a timer Node cannot sleep.
+A blocked agent is the case worth interrupting you for. An exhausted provider
+quota looks exactly like a turn that is still thinking, so a floor on that status
+means finding out hours later. `DONE_MIN_DURATION_SECONDS`,
+`BLOCKED_MIN_DURATION_SECONDS`, `WORKING_MIN_DURATION_SECONDS`,
+`IDLE_MIN_DURATION_SECONDS` and `ERROR_MIN_DURATION_SECONDS` each take their own
+number; all of them except `blocked` fall back to `MIN_DURATION_SECONDS`, and
+`blocked` inherits no floor at all.
 
-The rules live in `policy.mjs`, with `test/policy.test.mjs`; `notify.mjs`,
-`replies.mjs` and `doctor.mjs` call into it. Upstream files are otherwise
-unchanged.
+`BLOCKED_REPEAT_MINUTES` reports a pane again for as long as it stays blocked,
+instead of only at the moment it got stuck. `BLOCKED_IGNORE_QUIET_HOURS=1` lets
+those repeats through at night.
+
+`/settings`, `/settings all`, `/only blocked`, `/min done 120`, `/set KEY VALUE`
+and `/unset KEY` change the policy from the chat. The daemon re-reads the `.env`
+on every event, so no restart is involved. The token and the chat id are not
+writable from there, by design.
+
+The sweeper runs when a reminder needs it, not only on `SWEEP_MINUTES`, and never
+on a timer Node cannot sleep.
+
+The rules live in `policy.mjs` with `test/policy.test.mjs`; `notify.mjs`,
+`replies.mjs`, `lib.mjs` and `doctor.mjs` call into it. The four test files that
+cover those modules grew with them, and `docs/guide.md`, `docs/core.md`,
+`.env.example` and `CHANGELOG.md` document the additions. No other file differs
+from the snapshot.
 
 ## Requirements
 
 Herdr TUI 0.8+ or herdr-core (the Herdr app), Node 18+, Linux or macOS.
-Linux: util-linux's `flock`. macOS: `brew install util-linux` (or `brew install flock`).
+Linux needs util-linux's `flock`. macOS: `brew install util-linux` (or
+`brew install flock`).
 
 ## Install
 
@@ -152,11 +162,12 @@ also carry them as buttons.
 | `/min done 120` | Shortest turn of a status worth a message; `/min done off` removes it. |
 | `/set KEY VALUE` · `/unset KEY` | Change any notification setting from the chat. |
 
-Everything that decides whether a message is sent is settable from the chat and
-read from the config dir's `.env`, so no restart is involved. That includes
-`/only blocked` for a blocked-only bot, and a separate floor per status, so short
-`done` turns can be silenced while a `blocked` agent still reports at any
-duration — `BLOCKED_REPEAT_MINUTES` keeps reporting one that stays blocked.
+You can change from the chat every setting that controls whether a message is
+sent, and the daemon reads them from the `.env` in the config dir on each event,
+so no restart is involved. That covers `/only blocked` for a blocked-only bot,
+and a floor per status, so you can silence short `done` turns while a `blocked`
+agent still reports at any duration. `BLOCKED_REPEAT_MINUTES` keeps reporting the
+ones that stay blocked.
 
 [Command details, safety checks and limits](docs/guide.md#commands).
 
@@ -164,7 +175,8 @@ duration — `BLOCKED_REPEAT_MINUTES` keeps reporting one that stays blocked.
 
 Herdr TUI: run `herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`.
 Then reload config from the Herdr menu (or your `reload_config` key).
-Over SSH, run it where the Herdr window runs: the layout belongs to the **client machine's config**, not the server's. [Details](docs/guide.md#sidebar-tokens).
+Over SSH, run it where the Herdr window runs: the layout belongs to the config on
+the client machine, not on the server. [Details](docs/guide.md#sidebar-tokens).
 
 In the Herdr app, a mod draws the same badges in a band at the bottom of the
 window instead: [install it](docs/core.md#sidebar).
