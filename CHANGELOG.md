@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `MUTE_MINUTES` is editable from the chat like any other setting, including the
+  one a bare `/mute` uses. A timer setting above a week is refused rather than
+  handed to `setTimeout`, which clamps it to a millisecond and spins the sweeper.
 - Notification settings are edited from the chat: `/settings` shows what reaches
   the phone now, `/only blocked` narrows it to one status, `/min done 120` sets a
   floor, and `/set KEY VALUE` / `/unset KEY` change anything else. Each writes the
@@ -13,7 +16,8 @@
   waiting on a question — or on a provider quota that ran out — was silent
   after its first message. Each repeat carries how long it has been waiting. Off
   by default; it starts the sweeper on its own, since there is no event to ride
-  on.
+  on — and so does `BLOCKED_REMINDER_MINUTES`, which otherwise waited for an
+  event that a blocked pane never sends.
 - Durations are per status. `DONE_MIN_DURATION_SECONDS`,
   `WORKING_MIN_DURATION_SECONDS`, `IDLE_MIN_DURATION_SECONDS` and
   `ERROR_MIN_DURATION_SECONDS` override `MIN_DURATION_SECONDS`, so "quiet for

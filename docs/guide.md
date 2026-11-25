@@ -701,23 +701,27 @@ still there. Each repeat carries how long it has been waiting. Off by default;
 `10` reports every ten minutes. It is not gated by any `MIN_DURATION_SECONDS`,
 including `BLOCKED_MIN_DURATION_SECONDS`.
 
-Repeats need a clock, and a blocked pane raises no event to ride on, so setting
-`BLOCKED_REPEAT_MINUTES` alone starts the sweeper below. `BLOCKED_REMINDER_MINUTES`
-does not: the first nudge is found by whichever event comes next.
+Both need a clock, and a blocked pane raises no event to ride on — it is
+standing still, which is the whole situation being reported — so either setting
+on its own starts the sweeper below. Without one, the nudge or the repeat would
+be waiting for a status change that will never come.
 
 ### Sweeper
 
 `SWEEP_MINUTES` sets the background interval for queue retries and blocked
 reminders. It defaults to `0` (off), so both otherwise wait for a status
 change or pane closure. Set it to `5` to check every five minutes, including
-when all agents are waiting and no new events arrive. `BLOCKED_REPEAT_MINUTES`
-also starts it, at the shorter of the two intervals, since a repeat cannot wait
-for an event that will not come.
+when all agents are waiting and no new events arrive. `BLOCKED_REMINDER_MINUTES`
+and `BLOCKED_REPEAT_MINUTES` start it too, at the shortest of the intervals
+asked for, since a reminder cannot wait for an event that will not come. It
+never runs more often than every 30 seconds, whatever the settings say.
 
-With `SWEEP_MINUTES` or `BLOCKED_REPEAT_MINUTES` enabled, the sweeper starts
+With `SWEEP_MINUTES`, `BLOCKED_REMINDER_MINUTES` or `BLOCKED_REPEAT_MINUTES` enabled, the sweeper starts
 when Herdr starts, or on the next status change after you turn it on. After you
 set both back to `0`, it stops on its next pass, up to one interval later.
-To stop it immediately, kill the pid in `sweep.lock`. A lock allows only one
+To stop it immediately, kill the pid in `sweep.lock`. A value above a week is
+refused: Node clamps a longer timer to one millisecond, which would turn a
+sleepy sweeper into a spinning one. A lock allows only one
 sweeper at a time. `herdr plugin action invoke doctor` reports its status;
 `sweep.log` in the state directory contains its log.
 

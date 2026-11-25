@@ -133,6 +133,19 @@ Claude agents in one folder keep their own transcript.
   that exists is checked out, a new one starts from HEAD.
 - **/stop** uses `hc interrupt` (Esc for agents that report status).
 - **Mute.** `node daemon.mjs mute`, or `/mute` from the chat.
+- **A blocked agent keeps talking.** This matters more here than under Herdr
+  TUI, because the daemon only runs on an event: a blocked terminal stops
+  changing status, so nothing further arrives and an agent waiting on a
+  question — or on a provider quota that ran out — would be silent after its
+  first message. `BLOCKED_REPEAT_MINUTES=10` reports it again every ten
+  minutes, for as long as it stands there, each time with how long it has been
+  waiting. It starts the sweeper on its own; `SWEEP_MINUTES` is not needed. No
+  `MIN_DURATION_SECONDS` holds a blocked message back, including
+  `BLOCKED_MIN_DURATION_SECONDS` unless you set it deliberately.
+- **Tuning from the phone.** `/settings` shows what reaches the phone now and
+  `/only blocked`, `/min done 120`, `/set KEY VALUE` and `/unset KEY` change it
+  from the chat. The daemon re-reads the `.env` on every event, so a change
+  applies to the next one — no restart of the systemd unit.
 
 ## Sidebar
 
