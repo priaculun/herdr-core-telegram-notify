@@ -298,8 +298,19 @@ test("a nudge Telegram refused is owed again, not lost for the stretch", async (
     const afterFailure = JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
     assert.equal(afterFailure.remindedAt, undefined, "a refused nudge must not count as sent");
 
-    // Second pass: the same stretch still owes its nudge, and gets it.
-    await runSweeper(fx, working.base, { until: () => working.sent.length >= 1 });
+    // Second pass: the same stretch still owes its nudge, and gets it. Waited on
+    // the state file rather than on the send, because the record is written just
+    // after the send returns and killing the sweeper on the send alone would
+    // race that write.
+    await runSweeper(fx, working.base, {
+      until: () => {
+        try {
+          return Boolean(JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8")).remindedAt);
+        } catch {
+          return false;
+        }
+      },
+    });
     const texts = working.sent.map((m) => m.text);
     assert.match(texts[0], /still blocked/, texts.join("\n---\n"));
     const afterSuccess = JSON.parse(readFileSync(join(fx.stateDir, "state-wA_p1.json"), "utf8"));
