@@ -391,6 +391,14 @@ poller start tries again.
 | `/set KEY VALUE` | Change any notification setting, e.g. `/set QUIET_HOURS 23:00-07:00`. |
 | `/unset KEY` | Put a setting back to its default. |
 
+What `/set` can reach is the settings that decide what reaches the phone. It
+cannot change `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` or
+`REPLY_ALLOWED_USER_IDS` (a chat that can widen its own guest list is not
+protected by it), and it cannot change `MASK_SECRETS`, `WHISPER_BIN`,
+`WHISPER_MODEL`, `WHISPER_LANGUAGE`, `CORE_AGENT_KINDS` or `CORE_MACHINES`.
+Those four decide what gets printed or what this process goes on to execute, so
+they stay in the file you edit by hand.
+
 Only `/mute`, `/new`, `/settings`, `/only`, `/min`, `/set` and `/unset` accept
 arguments. Extra arguments on the other commands
 produce a usage message without changing anything. In groups, you can address your bot

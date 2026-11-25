@@ -362,7 +362,18 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
         parts,
       });
       rememberMessage(stateDir, messageId, paneId, info.session, question, undefined, parts);
-      writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
+      // Reread before marking: the send is a network round trip, and an agent
+      // that answered during it has already written its new status. Writing this
+      // pass's snapshot back would restore `blocked` with the old start time, and
+      // the next real blocked event would then hit the "already blocked" early
+      // return and never be announced.
+      const key = file.replace(/^state-|\.json$/g, "");
+      const fresh = readState(stateDir, key);
+      if (!fresh.status || fresh.status === "blocked") {
+        // The current file wins over this pass's snapshot, so a start time that
+        // moved during the send is the one kept.
+        writeState(stateDir, key, { ...(fresh.status ? fresh : state), remindedAt: Date.now() });
+      }
       sent += 1;
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);

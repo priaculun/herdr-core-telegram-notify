@@ -9,6 +9,14 @@ at `f15304d`; the entries below are what this fork adds on top.
 - `MUTE_MINUTES` is editable from the chat like any other setting, including the
   one a bare `/mute` uses. A timer setting above a week is refused rather than
   handed to `setTimeout`, which clamps it to a millisecond and spins the sweeper.
+- `/set` cannot reach the settings that decide what gets printed or run:
+  `MASK_SECRETS`, `WHISPER_BIN`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`,
+  `CORE_AGENT_KINDS`, `CORE_MACHINES` and `REPLY_ALLOWED_USER_IDS` stay in the
+  file you edit by hand, alongside the token and chat id.
+- A `.env` that is a symlink into a dotfiles repo is written through the link
+  rather than replaced by a regular file, so a dotfile sync cannot revert a
+  setting set from the chat. A setting that cannot be locked is refused with a
+  reason instead of rewritten unserialised.
 - Notification settings are edited from the chat: `/settings` shows what reaches
   the phone now, `/only blocked` narrows it to one status, `/min done 120` sets a
   floor, and `/set KEY VALUE` / `/unset KEY` change anything else. Each writes the

@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -135,6 +135,42 @@ test("the chat may change notification settings and not the credentials", () => 
   assert.ok(EDITABLE_KEYS.includes("MUTE_MINUTES"));
   assert.equal(validateSetting("MUTE_MINUTES", "30"), undefined);
   assert.match(validateSetting("MUTE_MINUTES", "0"), /1 or more/);
+  // A setting that decides what reaches the phone may be changed from the chat.
+  // One that decides what the bot is allowed to run, or that widens the guest
+  // list of the chat itself, may not: /set MASK_SECRETS 0 would print
+  // credentials into the message, and the rest each name a program or a machine
+  // this process goes on to execute.
+  for (const key of ["MASK_SECRETS", "WHISPER_BIN", "CORE_AGENT_KINDS", "CORE_MACHINES", "REPLY_ALLOWED_USER_IDS"]) {
+    assert.ok(!EDITABLE_KEYS.includes(key), `${key} must not be writable from the chat`);
+    assert.match(validateSetting(key, "0"), /not a notification setting/);
+  }
+});
+
+test("a status list that names nothing is refused, not written", () => {
+  // "," is not empty, so an emptiness check alone lets it through. Written, it
+  // leaves notifyStatuses() with nothing to send — including blocked, which is
+  // the one status the whole setup exists for.
+  assert.match(validateSetting("NOTIFY_STATUSES", ","), /at least one status/);
+  assert.match(validateSetting("NOTIFY_STATUSES", " , , "), /at least one status/);
+  assert.equal(validateSetting("NOTIFY_STATUSES", " blocked , done "), undefined);
+  // MUTE_MINUTES is read back through a cap, so a larger value would validate
+  // and then mute nothing at all.
+  assert.match(validateSetting("MUTE_MINUTES", "20000"), /capped at 10080/);
+  assert.equal(validateSetting("MUTE_MINUTES", "10080"), undefined);
+});
+
+test("a setting written through a symlinked .env lands in the file it points at", () => {
+  // A dotfiles setup symlinks .env into a repo. Renaming over the link would
+  // replace it with a regular file: the repo keeps the old value, the setting
+  // looks applied, and the next dotfile sync reverts it.
+  const dir = mkdtempSync(join(tmpdir(), "policy-link-"));
+  const real = join(dir, "dotfiles.env");
+  writeFileSync(real, "QUIET_HOURS=22:00-06:00\n");
+  symlinkSync(real, join(dir, ".env"));
+  writeEnvSetting(dir, "DONE_MIN_DURATION_SECONDS", "45");
+  assert.match(readFileSync(real, "utf8"), /^DONE_MIN_DURATION_SECONDS=45$/m, "the target file was not the one written");
+  assert.equal(lstatSync(join(dir, ".env")).isSymbolicLink(), true, "the link was replaced by a regular file");
+  assert.match(readFileSync(join(dir, ".env"), "utf8"), /^DONE_MIN_DURATION_SECONDS=45$/m);
 });
 
 test("a timer longer than Node can sleep is refused rather than handed to setTimeout", () => {
@@ -232,10 +268,27 @@ test("the summary names what is in force, and the key list hides the secrets", (
   assert.match(summary, /▫️ working/);
   assert.match(summary, /10/);
   assert.match(summary, /\/tmp\/x\/\.env/);
+  // A capped timer is printed in minutes, not in a fraction of one: a hand
+  // edited .env holding a huge value used to render `repeat every 35791.394…m`.
+  const huge = conf({ BLOCKED_REPEAT_MINUTES: "99999999999999999999" });
+  assert.match(policySummary(huge), /repeat every \d+m/);
 
   const all = settingsList(cfg, { envPath: "/tmp/x/.env" });
   assert.match(all, /QUIET_HOURS/);
   assert.ok(!all.includes("123:abc"), "the token is not echoed into the chat");
+  // The list has to agree with the notifier, not with the raw key: under
+  // herdr-core the default grows `error`, and a list showing the key alone would
+  // contradict the summary above it.
+  // isCore() reads the backend off the environment, so the test sets it the way
+  // the daemon does and puts it back afterwards.
+  const before = process.env.HERDR_BACKEND;
+  process.env.HERDR_BACKEND = "core";
+  try {
+    assert.match(settingsList(conf()), /^NOTIFY_STATUSES=done,blocked,error$/m);
+  } finally {
+    if (before === undefined) delete process.env.HERDR_BACKEND;
+    else process.env.HERDR_BACKEND = before;
+  }
 });
 
 test("status helpers agree with the status list", () => {

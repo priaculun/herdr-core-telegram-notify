@@ -7,11 +7,22 @@
 // turn that is thinking), so `blocked` never inherits a duration meant to quiet
 // short `done` turns. It can be given one of its own, and nothing else.
 
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
-import { DEFAULTS, STATUSES, holdFlock, inQuietHours, isOn, notifyStatuses, parseQuietHours, toInt } from "./lib.mjs";
+import {
+  DEFAULTS,
+  MUTE_MAX_MINUTES,
+  STATUSES,
+  flockAvailable,
+  holdFlock,
+  inQuietHours,
+  isOn,
+  notifyStatuses,
+  parseQuietHours,
+  toInt,
+} from "./lib.mjs";
 
 // The order a summary lists them in: the two that notify by default first, which
 // is also the order lib.mjs already keeps them in. One list, so a status added
@@ -129,15 +140,33 @@ export function sweepIntervalMs(cfg) {
 
 // ----------------------------------------------------------------- settings
 
-// The keys the bot may write. Everything in DEFAULTS is a notification setting,
-// which is what "custom from the phone" has to mean; the token and chat id are
-// deliberately not among them — a chat that can rewrite the credential it is
-// authenticated by is one bad message away from being locked out.
+// The keys the bot may write. Not every key in DEFAULTS belongs here: a setting
+// that decides what reaches the phone does, and one that decides what the bot is
+// allowed to execute does not. The token and chat id are out because a chat that
+// can rewrite the credential it is authenticated by is one bad message away from
+// being locked out. The four below are the same class of mistake in different
+// clothes: /set MASK_SECRETS 0 would print credentials into the chat, and
+// WHISPER_BIN, CORE_AGENT_KINDS and CORE_MACHINES each name a program or a
+// machine this process goes on to run. REPLY_ALLOWED_USER_IDS is the guest list
+// for the chat itself, so widening it from inside the chat defeats it.
 // MUTE_MINUTES is not in DEFAULTS (it lives in EXTRA_KEYS) but it is a
 // notification setting like any other: it is what a bare /mute uses, so leaving
 // it out would make the one setting a phone user reaches for most the one they
 // have to go back to a shell for.
-export const EDITABLE_KEYS = [...Object.keys(DEFAULTS), "MUTE_MINUTES"];
+const NOT_EDITABLE = new Set([
+  "MASK_SECRETS",
+  "WHISPER_BIN",
+  "WHISPER_MODEL",
+  "WHISPER_LANGUAGE",
+  "CORE_AGENT_KINDS",
+  "CORE_MACHINES",
+  "REPLY_ALLOWED_USER_IDS",
+]);
+
+export const EDITABLE_KEYS = [
+  ...Object.keys(DEFAULTS).filter((key) => !NOT_EDITABLE.has(key)),
+  "MUTE_MINUTES",
+];
 
 // A week. Past this the setting is not a schedule but a typo, and the timer it
 // would configure is one Node clamps into a spin.
@@ -157,7 +186,7 @@ const NUMBER_KEYS = new Map([
   ["PROMPT_CHARS", { min: 1 }],
   ["LAST_MESSAGE_CHARS", { min: 1 }],
   ["SCREEN_LINES", { min: 1 }],
-  ["MUTE_MINUTES", { min: 1 }],
+  ["MUTE_MINUTES", { min: 1, max: MUTE_MAX_MINUTES }],
   ["TELEGRAM_TOPIC_ID", { min: 1 }],
   ["MIN_DURATION_SECONDS", { min: 0 }],
   ...STATUSES.map((status) => [STATUS_MIN_DURATION_KEYS[status], { min: 0 }]),
@@ -195,8 +224,12 @@ export function validateSetting(key, value) {
     // own. Refusing it would make the one key that decides everything the only
     // one that cannot be put back from the chat.
     if (value === undefined) return undefined;
-    if (!text) return "NOTIFY_STATUSES needs at least one status";
-    const bad = text.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s && !STATUSES.includes(s));
+    const tokens = text.split(",").map((s) => s.trim()).filter(Boolean);
+    // "," is non-empty and names nothing, which would leave the notifier
+    // switched off entirely — including for blocked, the one status the whole
+    // setup exists for. An empty list is the same mistake as a misspelled one.
+    if (!tokens.length) return "NOTIFY_STATUSES needs at least one status";
+    const bad = tokens.map((s) => s.toLowerCase()).filter((s) => !STATUSES.includes(s));
     return bad.length ? `${bad.join(", ")} is not a status (${STATUSES.join(", ")})` : undefined;
   }
   if (key === "QUIET_HOURS") {
@@ -235,6 +268,14 @@ export function writeEnvSetting(dir, key, value) {
   // new one. Without flock there is no lock — the write is still atomic, which
   // is the part that matters for a reader.
   const release = holdFlock(`${path}.lock`, { waitSeconds: 5 });
+  // holdFlock answers undefined both when flock(1) is missing and when the wait
+  // ran out. The first is a machine without the tool and the write is still
+  // atomic, so it goes ahead; the second means another /set is mid-rewrite, and
+  // two whole-file rewrites without the lock lose one of them — the loser would
+  // then read the winner's value back and report it as its own.
+  if (release === undefined && flockAvailable()) {
+    throw new Error(`could not lock ${path} to change ${key}; try again in a moment`);
+  }
   try {
     return writeEnvLocked(path, key, value);
   } finally {
@@ -242,7 +283,16 @@ export function writeEnvSetting(dir, key, value) {
   }
 }
 
-function writeEnvLocked(path, key, value) {
+function writeEnvLocked(linkPath, key, value) {
+  // A dotfiles setup symlinks .env into a repo. Renaming over the link would
+  // replace it with a regular file: the repo keeps the old value and the next
+  // sync quietly reverts the setting. So the real file is what gets rewritten.
+  let path = linkPath;
+  try {
+    path = realpathSync(linkPath);
+  } catch {
+    // No file yet, or a link whose target is gone: write where it was asked for.
+  }
   const dir = dirname(path);
   let text = "";
   try {
@@ -317,7 +367,7 @@ export function policySummary(cfg, { muteUntil, envPath } = {}) {
   );
   lines.push("");
   const { firstMs, repeatMs } = reminderTiming(cfg);
-  const minutes = (ms) => (ms ? `${ms / 60000}m` : "off");
+  const minutes = (ms) => (ms ? `${Math.round(ms / 60000)}m` : "off");
   lines.push("🚧 Blocked");
   lines.push(`delay ${duration(toInt(cfg("BLOCKED_DELAY_SECONDS"), 0))} · nudge after ${minutes(firstMs)} · repeat every ${minutes(repeatMs)}`);
   lines.push(`ignores quiet hours: ${yes(isOn(cfg("BLOCKED_IGNORE_QUIET_HOURS")))}`);
@@ -338,7 +388,9 @@ export function policySummary(cfg, { muteUntil, envPath } = {}) {
 export function settingsList(cfg, { envPath } = {}) {
   const lines = ["⚙️ Settings (current values)"];
   for (const key of EDITABLE_KEYS) {
-    const value = cfg(key);
+    // Same reason as policySummary: on herdr-core the default grows `error`, and
+    // a list that showed the raw key would contradict what is being sent.
+    const value = key === "NOTIFY_STATUSES" ? notifyStatuses(cfg).join(",") : cfg(key);
     lines.push(`${key}=${value === undefined || value === "" ? "(default)" : value}`);
   }
   if (envPath) lines.push("", `Config: ${envPath}`);
