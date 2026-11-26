@@ -1,0 +1,841 @@
+// The send path of a real hook run against a Telegram that misbehaves: a rate
+// limit, a server error, markup it will not take, and a rejection no retry can
+// fix. Each answer is scripted, so what is under test is what the hook does with
+// it — retry, fall back, queue, or give up — and not a stub of fetch.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+import { flockHeld, holdFlock, readState, rememberMessage, sleep, writeState } from "../lib.mjs";
+
+const HERE = fileURLToPath(new URL(".", import.meta.url));
+const NOTIFY = join(HERE, "..", "notify.mjs");
+
+// Answers the scripted replies in order, then OK for anything after them.
+async function fakeTelegram(script = []) {
+  const sent = [];
+  const methods = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      sent.push(JSON.parse(body || "{}"));
+      methods.push(req.url.split("/").pop());
+      const next = script.shift() ?? { status: 200 };
+      res.writeHead(next.status, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(next.body ?? (next.status === 200 ? { ok: true, result: { message_id: sent.length } } : { ok: false }))
+      );
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { sent, methods, base: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
+}
+
+function fakeHerdr(dir, agents = [], readsScreen = true, metadataError = false) {
+  const path = join(dir, "herdr");
+  // JSON argv distinguishes a pane read from a display-only metadata report,
+  // and keeps token values containing spaces available to the assertions.
+  writeFileSync(path, `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(dir, "herdr-argv.jsonl"))}, JSON.stringify(args) + "\\n");
+const agents = ${JSON.stringify(agents)};
+if (args[1] === "report-metadata") {
+  if (${metadataError}) { console.error("Metadata reports are unavailable"); process.exit(1); }
+  console.log(JSON.stringify({ result: {} }));
+} else if (args[0] === "pane" && args[1] === "read") {
+  const screen = ${JSON.stringify(typeof readsScreen === "string" ? readsScreen : readsScreen ? "Do you want to create notes.md?\n 1. Yes" : undefined)};
+  if (!screen) process.exit(1);
+  console.log(screen);
+} else if (args[0] === "agent" && args[1] === "get") {
+  const agent = agents.find((a) => a.pane_id === args[2]);
+  if (!agent) process.exit(1);
+  console.log(JSON.stringify({ result: { agent } }));
+} else if (args[0] === "api") {
+  console.log(JSON.stringify({ result: { snapshot: { workspaces: [], panes: agents.map(({ tokens, ...pane }) => pane), agents } } }));
+} else process.exit(1);
+`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+function fixture(extraEnv = [], agents = [], readsScreen = true, metadataError = false) {
+  const root = mkdtempSync(join(tmpdir(), "send-test-"));
+  const stateDir = join(root, "state");
+  const configDir = join(root, "config");
+  mkdirSync(stateDir);
+  mkdirSync(configDir);
+  writeFileSync(
+    join(configDir, ".env"),
+    [
+      "TELEGRAM_BOT_TOKEN=123456789:AAtesttesttesttesttesttesttest",
+      "TELEGRAM_CHAT_ID=42",
+      // Nothing that would need a real herd or a transcript on this machine.
+      "SHOW_PROJECT=0",
+      "SHOW_BRANCH=0",
+      "SHOW_CHANGES=0",
+      "SHOW_HERD=0",
+      "SHOW_LAST_MESSAGE=0",
+      "SHOW_TOKENS=0",
+      "SHOW_DURATION=0",
+      "SHOW_PROMPT=0",
+      "SIDEBAR_TOKENS=0",
+      ...extraEnv,
+    ].join("\n")
+  );
+  chmodSync(join(configDir, ".env"), 0o600);
+  return { root, stateDir, configDir, herdr: fakeHerdr(root, agents, readsScreen, metadataError),
+    argv: () => lines(join(root, "herdr-argv.jsonl")) };
+}
+
+// One status change or pane closure, as Herdr fires it.
+function hook(fx, base, paneId, { title, status = "done", closed = false, context = {}, onSpawn } = {}) {
+  const child = spawn(process.execPath, [NOTIFY], {
+    env: {
+      ...process.env,
+      HERDR_PLUGIN_EVENT: closed ? "pane.closed" : "pane.agent_status_changed",
+      HERDR_PLUGIN_EVENT_JSON: JSON.stringify(closed ? {
+        event: "pane_closed",
+        data: { type: "pane_closed", pane_id: paneId, workspace_id: "wA" },
+      } : {
+        data: { pane_id: paneId, agent_status: status, agent: "claude", ...(title ? { title } : {}) },
+      }),
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify(context),
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      HERDR_BIN_PATH: fx.herdr,
+      TELEGRAM_API_BASE: base,
+    },
+  });
+  onSpawn?.(child);
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (out += d));
+  return new Promise((resolve) => child.on("exit", (code) => resolve({ out, code })));
+}
+
+// A hook that starts the sweeper leaves a detached process behind on purpose, so
+// a test whose fixture sets a reminder has to stop it: the next run would find
+// the lock taken and see the sweeper it did not start. The sweeper names its own
+// pid on the way in, which is how it is found again.
+function stopSweeper(fx) {
+  let log = "";
+  try {
+    log = readFileSync(join(fx.stateDir, "sweep.log"), "utf8");
+  } catch {
+    return;
+  }
+  for (const [, pid] of log.matchAll(/sweeping \(pid (\d+)\)/g)) {
+    try {
+      process.kill(Number(pid), "SIGKILL");
+    } catch {}
+  }
+}
+
+const lines = (path) =>
+  existsSync(path)
+    ? readFileSync(path, "utf8")
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l))
+    : [];
+
+const pending = (fx) => lines(join(fx.stateDir, "pending.jsonl"));
+const remembered = (fx) => lines(join(fx.stateDir, "messages.jsonl"));
+
+test("notifications select the event agent's snapshot tokens after the clock, with no line when unset or absent", async () => {
+  const tokens = { quota_5h_warning: "5h 25% 59m", model: "Model Cedar", context: "context 13%", telegram: "📨 09:12" };
+  for (const entry of [
+    { setting: "model,context,quota_5h_*,telegram", tokens, expected: "📊 Model Cedar · context 13% · 5h 25% 59m" },
+    { setting: "model,*" },
+    { setting: "telegram,tele*,*", tokens: { telegram: "📱 09:12" } },
+    { setting: "", tokens },
+    { tokens },
+  ]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([
+      "SHOW_TITLE=0", "SHOW_PANE=0", "SHOW_TIMESTAMP=1", "SHOW_SCREEN_ON_BLOCKED=0",
+      ...(entry.setting === undefined ? [] : [`SHOW_AGENT_TOKENS=${entry.setting}`]),
+    ], [
+      { pane_id: "wA:p7", agent_status: "done", tokens: entry.tokens },
+      { pane_id: "wA:p8", tokens: { model: "Model Birch" } },
+    ]);
+    try {
+      const { code, out } = await hook(fx, tg.base, "wA:p7");
+      assert.equal(code, 0, out);
+      assert.equal(tg.sent.length, 1);
+      const rows = tg.sent[0].text.split("\n");
+      const clock = rows.findIndex((row) => row.startsWith("⏱"));
+      assert.ok(clock >= 0);
+      if (entry.expected) {
+        assert.equal(rows[clock + 1], entry.expected);
+        assert.equal(remembered(fx)[0].parts.agentTokens, entry.expected);
+      } else assert.equal(rows.some((row) => row.startsWith("📊")), false);
+      assert.ok(!tg.sent[0].text.includes("Model Birch"));
+      assert.ok(!tg.sent[0].text.includes("📨 09:12") && !tg.sent[0].text.includes("📱 09:12"));
+      const snapshots = fx.argv().filter((args) => args[0] === "api" && args[1] === "snapshot");
+      assert.equal(snapshots.length, entry.setting ? 1 : 0);
+      assert.equal(fx.argv().some((args) => args[0] === "agent" && args[1] === "list"), false);
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("queued notifications keep the captured agent metadata even after the setting is turned off", async () => {
+  const rejected = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const accepted = await fakeTelegram();
+  const fx = fixture(["SHOW_AGENT_TOKENS=model"], [{ pane_id: "wA:p7", tokens: { model: "Model Cedar" } }]);
+  try {
+    const first = await hook(fx, rejected.base, "wA:p7");
+    assert.equal(pending(fx).length, 1, first.out);
+    assert.equal(pending(fx)[0].parts.agentTokens, "📊 Model Cedar");
+    const env = join(fx.configDir, ".env");
+    writeFileSync(env, readFileSync(env, "utf8") + "\nSHOW_AGENT_TOKENS=\n");
+    const { code, out } = await hook(fx, accepted.base, "wA:p8", { status: "working" });
+    assert.equal(code, 0, out);
+    assert.equal(accepted.sent.length, 1);
+    assert.match(accepted.sent[0].text, /📊 Model Cedar/);
+    assert.deepEqual(pending(fx), []);
+  } finally {
+    rejected.close();
+    accepted.close();
+  }
+});
+
+test("blocked reminders include fresh selected agent metadata after the waiting line", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SHOW_AGENT_TOKENS=model", "BLOCKED_REMINDER_MINUTES=1", "SHOW_SCREEN_ON_BLOCKED=0"], [
+    { pane_id: "wA:p7", agent_status: "blocked", tokens: { model: "Model Cedar", telegram: "📱 09:12" } },
+  ]);
+  writeFileSync(join(fx.stateDir, "state-wA_p7.json"), JSON.stringify({
+    status: "blocked", updatedAt: Date.now() - 30 * 60_000, paneId: "wA:p7",
+  }));
+  try {
+    const { code, out } = await hook(fx, tg.base, "wA:p8", { status: "working" });
+    assert.equal(code, 0, out);
+    assert.equal(tg.sent.length, 1);
+    assert.match(tg.sent[0].text, /⏱ waiting [^\n]+\n📊 Model Cedar/);
+    assert.equal(remembered(fx)[0].parts.agentTokens, "📊 Model Cedar");
+  } finally {
+    stopSweeper(fx);
+    tg.close();
+  }
+});
+
+test("a sent notification reports a pane sidebar token and a resolving status clears it", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SIDEBAR_TOKENS="]);
+  try {
+    const first = await hook(fx, tg.base, "wA:p1");
+    assert.equal(first.code, 0, first.out);
+    const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+    const sent = reports.find((a) => a.includes("--token"));
+    assert.deepEqual(sent.slice(0, 5), ["pane", "report-metadata", "wA:p1", "--source", "naturalmoods.herdr-telegram-notify"]);
+    assert.match(sent[sent.indexOf("--token") + 1], /^telegram=📨 \d\d:\d\d$/);
+    assert.equal(sent.includes("--ttl-ms"), false);
+    assert.ok(BigInt(sent[sent.indexOf("--seq") + 1]) > 0n);
+    const next = await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.equal(next.code, 0, next.out);
+    const clear = fx.argv().filter((a) => a[1] === "report-metadata").at(-1);
+    assert.equal(clear[clear.indexOf("--clear-token") + 1], "telegram");
+    assert.equal(BigInt(clear[clear.indexOf("--seq") + 1]), BigInt(sent[sent.indexOf("--seq") + 1]) + 1n,
+      "resolution used its arrival time and could erase newer phone activity");
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("sidebar reports are absent when disabled or dry, and failed reports do not stop notifications", async () => {
+  for (const entry of [
+    { env: ["SIDEBAR_TOKENS=0"] }, { env: ["SIDEBAR_TOKENS=1", "DRY_RUN=1"], dry: true },
+    { env: ["SIDEBAR_TOKENS=1"], fails: true }, { env: ["SIDEBAR_TOKENS=1", "DEBUG=1"], fails: true, debug: true },
+    { env: ["SIDEBAR_TOKENS=1"], muted: true },
+    { env: ["SIDEBAR_TOKENS=1", "NOTIFY_STATUSES=blocked"], filtered: true },
+  ]) {
+    const tg = await fakeTelegram();
+    const fx = fixture(entry.env, [], true, entry.fails);
+    if (entry.muted) writeFileSync(join(fx.stateDir, "mute.json"), JSON.stringify({ until: Date.now() + 60_000 }));
+    try {
+      const { out, code } = await hook(fx, tg.base, "wA:p1");
+      assert.equal(code, 0, out);
+      const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+      assert.equal(tg.methods.length, entry.dry || entry.muted || entry.filtered ? 0 : 1);
+      if (entry.fails) {
+        assert.ok(reports.some((a) => a.includes("--token")));
+        assert.equal(out.includes("sidebar token report failed"), Boolean(entry.debug), out);
+      } else if (entry.dry || entry.env.includes("SIDEBAR_TOKENS=0")) assert.deepEqual(reports, []);
+      else assert.ok(reports.every((a) => a.includes("--clear-token")), "a dropped notification was shown as sent");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("a queued notification gets its sidebar token only after delivery", async () => {
+  const rejected = await fakeTelegram([{ status: 400 }, { status: 400 }]);
+  const accepted = await fakeTelegram();
+  const fx = fixture(["SIDEBAR_TOKENS=1"]);
+  writeFileSync(join(fx.stateDir, "pending.jsonl"), JSON.stringify({
+    at: Date.now(), paneId: "wA:p1",
+    parts: { emoji: "✅", agent: "example", statusLabel: "done", body: "Example queued response." },
+  }) + "\n");
+  try {
+    await hook(fx, rejected.base, "wA:p2", { status: "working" });
+    assert.equal(fx.argv().some((a) => a[1] === "report-metadata" && a.includes("--token")), false);
+    const delivered = await hook(fx, accepted.base, "wA:p2", { status: "idle" });
+    assert.equal(delivered.code, 0, delivered.out);
+    assert.equal(accepted.sent.length, 1, "a legacy queue entry was delivered twice");
+    assert.deepEqual(pending(fx), []);
+    assert.ok(fx.argv().some((a) => a[0] === "pane" && a[2] === "wA:p1" && a.some((v) => v.startsWith("telegram=📨 "))));
+  } finally {
+    rejected.close();
+    accepted.close();
+  }
+});
+
+test("titles and previously queued text and button labels use the current secret masking setting", async () => {
+  const secret = `ghp_${"x".repeat(36)}`;
+  for (const enabled of [true, false]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([`MASK_SECRETS=${enabled ? 1 : 0}`]);
+    const expected = enabled ? "ghp_…[masked]" : secret;
+    writeFileSync(join(fx.stateDir, "pending.jsonl"), JSON.stringify({
+      id: "example-queued-message",
+      at: Date.now(),
+      paneId: "wZ:p7",
+      parts: {
+        emoji: "✅",
+        agent: "example",
+        statusLabel: "done",
+        title: `Saved ${secret}`,
+        prompt: `▸ Use ${secret}`,
+        body: `Printed ${secret}`,
+        options: [{ n: "1", label: secret }, { n: "2", label: "Cancel" }],
+      },
+    }) + "\n", { mode: 0o600 });
+    try {
+      const { out, code } = await hook(fx, tg.base, "wZ:p8", { title: `Example ${secret}` });
+      assert.equal(code, 0, out);
+      assert.deepEqual(tg.methods, ["sendMessage", "sendMessage"], out);
+      const [queued, current] = tg.sent;
+      assert.ok(queued.text.includes(`Saved ${expected}`));
+      assert.ok(queued.text.includes(`▸ Use ${expected}`));
+      assert.ok(queued.text.includes(`Printed ${expected}`));
+      assert.deepEqual(queued.reply_markup.inline_keyboard, [
+        [{ text: `1. ${expected}`, callback_data: "1" }],
+        [{ text: "2. Cancel", callback_data: "2" }],
+      ]);
+      assert.ok(current.text.includes(`Example ${expected}`));
+      const entry = lines(join(fx.stateDir, "messages.jsonl")).find((e) => e.id === 2);
+      assert.equal(entry.parts.title, `Example ${expected}`);
+      if (enabled) assert.ok(tg.sent.every((message) => !message.text.includes(secret)));
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("a blocked delay sends only the same live episode, with a fresh screen and buttons", async () => {
+  const paneId = "wZ:p8";
+  const key = "wZ_p8";
+  const oldScreen = "Earlier question?\n❯ 1. Earlier option\n  2. Cancel";
+  const newScreen = "Current question?\n❯ 1. Updated option\n  2. Cancel";
+  for (const change of ["working state", "new episode", "live working", "missing live agent", "unchanged"]) {
+    const tg = await fakeTelegram();
+    const agent = { pane_id: paneId, agent_status: "blocked" };
+    const fx = fixture(["BLOCKED_DELAY_SECONDS=1", "MIN_DURATION_SECONDS=60", "REPLIES=1", "DEBUG=1"], [agent], oldScreen);
+    // Stand in for the poller's ownership, so buttons are enabled without
+    // starting a detached process just to receive no replies.
+    const release = holdFlock(join(fx.stateDir, "replies.lock"));
+    assert.ok(release);
+    writeState(fx.stateDir, key, { status: "working", workingSince: Date.now(), paneId });
+    let child;
+    const sending = hook(fx, tg.base, paneId, { status: "blocked", onSpawn: (p) => { child = p; } });
+    try {
+      const deadline = Date.now() + 10_000;
+      let began;
+      while ((began = readState(fx.stateDir, key)).status !== "blocked") {
+        assert.ok(Date.now() < deadline, "the hook did not record its blocked state");
+        await sleep(20);
+      }
+      assert.equal(tg.sent.length, 0, change);
+      for (const lock of ["state.lock", "sweep-run.lock"]) {
+        assert.equal(flockHeld(join(fx.stateDir, lock)), false, lock);
+      }
+      if (change === "working state") {
+        writeState(fx.stateDir, key, { ...began, status: "working", updatedAt: Date.now() });
+      } else if (change === "new episode") {
+        writeState(fx.stateDir, key, { ...began, updatedAt: began.updatedAt + 1 });
+      }
+      const agents = change === "missing live agent" ? [] : [
+        { ...agent, agent_status: change === "live working" ? "working" : "blocked" },
+      ];
+      fakeHerdr(fx.root, agents, newScreen);
+      const { out, code } = await sending;
+      assert.equal(code, 0, out);
+      assert.equal(pending(fx).length, 0);
+      if (change !== "unchanged") {
+        assert.equal(tg.sent.length, 0, change);
+        assert.equal(remembered(fx).length, 0, change);
+        assert.match(out, /answered within the blocked delay/, change);
+      } else {
+        assert.ok(Date.now() - began.updatedAt >= 1000, "the notification did not wait a second");
+        assert.deepEqual(tg.methods, ["sendMessage"], out);
+        assert.match(tg.sent[0].text, /Current question/);
+        assert.doesNotMatch(tg.sent[0].text, /Earlier/);
+        assert.deepEqual(tg.sent[0].reply_markup.inline_keyboard, [
+          [{ text: "1. Updated option", callback_data: "1" }],
+          [{ text: "2. Cancel", callback_data: "2" }],
+          [
+            { text: "🖥 screen", callback_data: "/screen" },
+            { text: "✎ diff", callback_data: "/diff" },
+            { text: "⏹ stop", callback_data: "/stop" },
+          ],
+        ]);
+        assert.equal(readState(fx.stateDir, key).updatedAt, began.updatedAt, "reminders must use the original blocked time");
+        assert.equal(remembered(fx).length, 1);
+        assert.doesNotMatch(out, /answered within the blocked delay/);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await sending;
+      release();
+      tg.close();
+    }
+  }
+});
+
+test("a dry run previews blocked output without waiting for live confirmation", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["BLOCKED_DELAY_SECONDS=1", "DRY_RUN=1"]);
+  try {
+    const { out, code } = await hook(fx, tg.base, "wZ:p8", { status: "blocked" });
+    assert.equal(code, 0, out);
+    assert.match(out, /sent as HTML/);
+    assert.match(out, /Do you want to create notes.md/);
+    assert.equal(tg.sent.length, 0);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a rate limit is waited out, and the message arrives rather than queueing", async () => {
+  // retry_after in seconds, as Telegram sends it — the hook honours it.
+  const tg = await fakeTelegram([{ status: 429, body: { ok: false, parameters: { retry_after: 1 } } }]);
+  const fx = fixture();
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1");
+    assert.equal(tg.sent.length, 2, out);
+    assert.match(out, /attempt 1 failed \(429.*retrying in 1s/);
+    assert.deepEqual(pending(fx), [], "a message that was accepted in the end was queued anyway");
+    assert.equal(remembered(fx).at(-1)?.paneId, "wA:p1"); // still answerable
+  } finally {
+    tg.close();
+  }
+});
+
+test("a blocked message that has to wait keeps the question it was waiting on", async () => {
+  const tg = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const fx = fixture();
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    const queued = pending(fx);
+    assert.equal(queued.length, 1, out);
+    // Read when the question was asked. Without it the reply to this message can
+    // never be checked against the screen, and the poller refuses it.
+    assert.ok(queued[0].question, "a queued question cannot be answered later");
+  } finally {
+    tg.close();
+  }
+});
+
+test("a blocked notification whose question cannot be read is still marked as one", async () => {
+  const agents = [{ pane_id: "wA:p1", agent: "claude", agent_status: "blocked" }];
+  // Nothing readable on the screen, so there is no question to fingerprint. The
+  // marker goes down in its place: without it this is indistinguishable from a
+  // finished turn, and the reply meant for the question would be delivered as a
+  // new instruction once the agent walked on.
+  const tg = await fakeTelegram();
+  const fx = fixture([], agents, false);
+  const queuedTg = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const queuedFx = fixture([], agents, false);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    assert.equal(remembered(fx)[0]?.question, "blocked:unknown", out);
+    // ...and it rides the queue the way a real question does, so a message the
+    // network was down for is no easier to answer wrongly than a live one.
+    const queued = await hook(queuedFx, queuedTg.base, "wA:p1", { status: "blocked" });
+    assert.equal(pending(queuedFx)[0]?.question, "blocked:unknown", queued.out);
+  } finally {
+    tg.close();
+    queuedTg.close();
+  }
+});
+
+test("a server error is retried, and only what is left over is kept", async () => {
+  const tg = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const fx = fixture();
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1");
+    assert.equal(tg.sent.length, 3, out); // SEND_ATTEMPTS, and then it gives up
+    const queued = pending(fx);
+    assert.equal(queued.length, 1, "the message was lost rather than kept for later");
+    assert.equal(queued[0].paneId, "wA:p1");
+  } finally {
+    tg.close();
+  }
+});
+
+test("a rejected token is not retried and not queued — no amount of waiting fixes it", async () => {
+  const tg = await fakeTelegram([{ status: 401, body: { ok: false, description: "Unauthorized" } }]);
+  const fx = fixture();
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1");
+    assert.equal(tg.sent.length, 1, out);
+    assert.match(out, /401/);
+    assert.deepEqual(pending(fx), [], "a message nothing can deliver was kept forever");
+  } finally {
+    tg.close();
+  }
+});
+
+test("markup Telegram will not take is resent as plain text, and costs no attempt", async () => {
+  // 400 is the markup, so the same message goes again without parse_mode; a
+  // second 400 would be a different failure, and one 502 after it proves the
+  // fallback did not spend the retries.
+  const tg = await fakeTelegram([{ status: 400, body: { ok: false, description: "can't parse entities" } }]);
+  const fx = fixture(["SHOW_TITLE=1"]);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { title: "fix <the> parser & ship" });
+    assert.equal(tg.sent.length, 2, out);
+    assert.match(out, /HTML rejected .* retrying as plain text/);
+    assert.equal(tg.sent[0].parse_mode, "HTML");
+    assert.match(tg.sent[0].text, /&amp;|&lt;/); // escaped for the first go
+    assert.equal(tg.sent[1].parse_mode, undefined);
+    assert.match(tg.sent[1].text, /fix <the> parser & ship/); // as a person wrote it
+    assert.deepEqual(pending(fx), []);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a message the network was down for goes out on the next event, and leaves the queue", async () => {
+  const fx = fixture();
+  // Nothing listening on this port: the first hook has nowhere to send.
+  await hook(fx, "http://127.0.0.1:1", "wA:p1");
+  assert.equal(pending(fx).length, 1);
+
+  const tg = await fakeTelegram();
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p2");
+    // The queue goes first and marked late, then the event that found it.
+    assert.equal(tg.sent.length, 2, out);
+    assert.match(tg.sent[0].text, /delayed/);
+    assert.match(tg.sent[0].text, /wA:p1/);
+    assert.ok(!/delayed/.test(tg.sent[1].text));
+    assert.deepEqual(pending(fx), [], "a delivered message stayed in the queue");
+    // Both are answerable: the late one is in the map under the pane it was about.
+    assert.deepEqual(
+      remembered(fx).map((e) => e.paneId),
+      ["wA:p1", "wA:p2"]
+    );
+  } finally {
+    tg.close();
+  }
+});
+
+// A transcript as Claude writes one: the prompt that opened the turn, then what
+// the agent answered with.
+function transcript(dir, said) {
+  const path = join(dir, "session.jsonl");
+  writeFileSync(
+    path,
+    [
+      JSON.stringify({ type: "user", timestamp: "2026-09-22T10:00:00Z", message: { role: "user", content: "go on" } }),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-09-22T10:01:00Z",
+        message: { role: "assistant", content: [{ type: "text", text: said }] },
+      }),
+    ].join("\n") + "\n"
+  );
+  return path;
+}
+
+test("the whole response is kept for /full, as it was before the message was cut down", async () => {
+  const tg = await fakeTelegram();
+  const root = mkdtempSync(join(tmpdir(), "send-turn-"));
+  const said = `${"a".repeat(400)}\nRéady ✅`;
+  const fx = fixture(["SHOW_LAST_MESSAGE=1", "LAST_MESSAGE_CHARS=50"], [
+    {
+      pane_id: "wA:p1",
+      agent: "claude",
+      agent_status: "done",
+      agent_session: { kind: "path", value: transcript(root, said) },
+    },
+  ]);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1");
+    // What went to the chat is the cut-down view...
+    assert.ok(tg.sent[0].text.length < said.length, out);
+    // ...and what was written down beside it is the whole of it, so /full can
+    // hand it back once the transcript has moved on.
+    assert.equal(remembered(fx)[0]?.full, said);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a message that has to wait keeps the response with it, and hands it on when it goes out", async () => {
+  const tg = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const root = mkdtempSync(join(tmpdir(), "send-turn-"));
+  const said = "the whole of what it said";
+  const fx = fixture(["SHOW_LAST_MESSAGE=1"], [
+    {
+      pane_id: "wA:p1",
+      agent: "claude",
+      agent_status: "done",
+      agent_session: { kind: "path", value: transcript(root, said) },
+    },
+  ]);
+  try {
+    const first = await hook(fx, tg.base, "wA:p1");
+    assert.equal(pending(fx)[0]?.full, said, first.out);
+    // The next event flushes it: the queued text is what is recorded, not
+    // whatever the transcript says by then.
+    const second = await hook(fx, tg.base, "wA:p9");
+    assert.equal(remembered(fx)[0]?.full, said, second.out);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a blocked agent's screen is not kept as its response — it is a pane, not a message", async () => {
+  const tg = await fakeTelegram();
+  const root = mkdtempSync(join(tmpdir(), "send-turn-"));
+  const fx = fixture(["SHOW_LAST_MESSAGE=1", "SHOW_SCREEN_ON_BLOCKED=1"], [
+    {
+      pane_id: "wA:p1",
+      agent: "claude",
+      agent_status: "blocked",
+      // The turn behind the question is an older one; handing it back as "the
+      // full response" to this notification would answer a question nobody asked.
+      agent_session: { kind: "path", value: transcript(root, "what it said last time") },
+    },
+  ]);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    assert.match(tg.sent[0].text, /Do you want to create notes.md\?/, out);
+    assert.equal(remembered(fx)[0]?.full, undefined);
+    assert.ok(remembered(fx)[0]?.question, "a blocked notification still records its question");
+  } finally {
+    tg.close();
+  }
+});
+
+test("a question answered at the keyboard is marked so in the chat, once, and loses its screen", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SHOW_SCREEN_ON_BLOCKED=1"]);
+  try {
+    await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"], out);
+    assert.equal(tg.sent[1].message_id, 1);
+    assert.match(tg.sent[1].text, /^✓ answered · \d\d:\d\d/);
+    assert.match(tg.sent[1].text, /claude · blocked/); // still says what it was
+    assert.ok(!/Do you want/.test(tg.sent[1].text), "the old question is still shown as if it were asked");
+    // Closed now: the next change has nothing of this pane's left to mark.
+    await hook(fx, tg.base, "wA:p1", { status: "done" });
+    assert.equal(tg.methods.filter((m) => m === "editMessageText").length, 1);
+  } finally {
+    tg.close();
+  }
+});
+
+test("closing a pane marks its notification once, forgets its state and refreshes the board without notifying", async () => {
+  for (const markResolved of [1, 0]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([`MARK_RESOLVED=${markResolved}`, "BOARD=1"], [
+      { pane_id: "wA:p2", agent: "pi", agent_status: "working" },
+    ]);
+    writeState(fx.stateDir, "wA_p1", { status: "blocked", updatedAt: Date.now(), paneId: "wA:p1" });
+    writeState(fx.stateDir, "wA_p2", { status: "working", updatedAt: Date.now(), paneId: "wA:p2" });
+    const otherState = readFileSync(join(fx.stateDir, "state-wA_p2.json"), "utf8");
+    rememberMessage(fx.stateDir, 101, "wA:p1", undefined, "saved question", undefined, {
+      emoji: "⚠️", agent: "claude", statusLabel: "blocked",
+      body: "Do you want to create notes.md?", bodyIsScreen: true,
+      options: [{ n: "1", label: "Yes" }],
+    });
+    rememberMessage(fx.stateDir, 102, "wA:p2", undefined, undefined, undefined, {
+      emoji: "⏳", agent: "pi", statusLabel: "working",
+    });
+    // An existing board should be edited rather than replaced by a new message.
+    writeFileSync(join(fx.stateDir, "board.json"), JSON.stringify({ messageId: 77, chatId: "42" }));
+    const closure = {
+      closed: true,
+      context: { focused_pane_id: "wA:p2", focused_pane_status: "done" },
+    };
+    try {
+      const { out, code } = await hook(fx, tg.base, "wA:p1", closure);
+      assert.equal(code, 0, out);
+      assert.deepEqual(tg.methods, markResolved ? ["editMessageText", "editMessageText"] : ["editMessageText"], out);
+      const edits = tg.sent.filter((m) => m.message_id === 101);
+      assert.equal(edits.length, markResolved);
+      if (markResolved) {
+        assert.match(edits[0].text, /^✕ pane closed · \d\d:\d\d/);
+        assert.ok(!edits[0].text.includes("Do you want"), "the closed pane's question is still shown");
+        assert.equal(edits[0].reply_markup, undefined, "the closed pane's buttons are still shown");
+      }
+      assert.ok(!existsSync(join(fx.stateDir, "state-wA_p1.json")), "the closed pane's state was kept");
+      assert.equal(readFileSync(join(fx.stateDir, "state-wA_p2.json"), "utf8"), otherState);
+      assert.equal(Boolean(remembered(fx).find((m) => m.id === 101).closed), Boolean(markResolved));
+      assert.ok(!remembered(fx).find((m) => m.id === 102).closed, "the focused pane's message was closed instead");
+      const board = tg.sent.find((m) => m.message_id === 77);
+      assert.ok(!board.text.includes("wA:p1"), "the board still lists the closed pane");
+      assert.ok(board.text.includes("wA:p2"), "the board lost the remaining pane");
+
+      // A repeated close may refresh the board, but must not edit a notification twice.
+      await hook(fx, tg.base, "wA:p1", closure);
+      assert.equal(tg.sent.filter((m) => m.message_id === 101).length, markResolved);
+      assert.ok(tg.methods.every((m) => m === "editMessageText"), "pane closure sent something new");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("a finished turn seen at the desk says so, and MARK_RESOLVED=0 leaves the chat alone", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture();
+  const offTg = await fakeTelegram();
+  const offFx = fixture(["MARK_RESOLVED=0"]);
+  try {
+    await hook(fx, tg.base, "wA:p1");
+    // Another pane's change marks nothing of this one.
+    await hook(fx, tg.base, "wA:p2", { status: "working" });
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "idle" });
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"], out);
+    assert.match(tg.sent[1].text, /^👀 seen at the desk/);
+
+    await hook(offFx, offTg.base, "wA:p1");
+    await hook(offFx, offTg.base, "wA:p1", { status: "idle" });
+    assert.deepEqual(offTg.methods, ["sendMessage"]);
+  } finally {
+    tg.close();
+    offTg.close();
+  }
+});
+
+test("the board is sent and pinned once, then edited in place, and replaced when it is gone", async () => {
+  const agents = [
+    { pane_id: "wA:p1", agent: "claude", agent_status: "done" },
+    { pane_id: "wA:p2", agent: "pi", agent_status: "blocked" },
+  ];
+  const tg = await fakeTelegram();
+  const fx = fixture(["BOARD=1", "MARK_RESOLVED=0"], agents);
+  try {
+    const first = await hook(fx, tg.base, "wA:p1");
+    assert.deepEqual(tg.methods, ["sendMessage", "pinChatMessage", "sendMessage"], first.out);
+    assert.equal(tg.sent[0].disable_notification, true); // the board never rings
+    assert.match(tg.sent[0].text, /⚠️ pi · \? · blocked · wA:p2/); // blocked first; no recorded change, no time
+    // p1's change was recorded before the board was drawn, so it carries a time.
+    assert.match(tg.sent[0].text, /done since \d\d:\d\d · wA:p1/);
+    assert.equal(tg.sent[1].message_id, 1);
+
+    await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.equal(tg.methods[3], "editMessageText");
+    assert.equal(tg.sent[3].message_id, 1);
+    assert.equal(tg.methods.length, 4, "a working change sent something besides the board");
+  } finally {
+    tg.close();
+  }
+
+  // Deleted in the chat: the edit is refused, and a new board takes its place.
+  const gone = await fakeTelegram([{ status: 400, body: { ok: false, description: "Bad Request: message to edit not found" } }]);
+  try {
+    const { out } = await hook(fx, gone.base, "wA:p1", { status: "done" });
+    assert.deepEqual(gone.methods.slice(0, 3), ["editMessageText", "sendMessage", "pinChatMessage"], out);
+  } finally {
+    gone.close();
+  }
+});
+
+test("a blocked agent's menu comes as buttons when replies are on, and goes when it is answered", async () => {
+  const menu = "Do you want to create notes.md?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No, and tell Claude what to do differently";
+  const tg = await fakeTelegram();
+  const fx = fixture(["REPLIES=1"], [], menu);
+  const offTg = await fakeTelegram();
+  const offFx = fixture([], [], menu);
+  // REPLIES=1 starts the poller too, against the same fake; only the notifier's
+  // own calls are looked at.
+  const calls = (t, method) => t.sent.filter((_, i) => t.methods[i] === method);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    const keyboard = calls(tg, "sendMessage")[0]?.reply_markup?.inline_keyboard;
+    assert.deepEqual(
+      keyboard?.map(([b]) => b.callback_data),
+      ["1", "2", "3", "/screen"],
+      out
+    );
+    assert.equal(keyboard[0][0].text, "1. Yes");
+    assert.ok(keyboard[2][0].text.length <= 48);
+    assert.deepEqual(keyboard[3].map((b) => b.callback_data), ["/screen", "/diff", "/stop"]);
+    // Answered: the edit carries no keyboard, so the buttons go with the question.
+    await hook(fx, tg.base, "wA:p1", { status: "working" });
+    const edits = calls(tg, "editMessageText");
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].reply_markup, undefined);
+
+    // Nobody is listening for the tap without REPLIES.
+    await hook(offFx, offTg.base, "wA:p1", { status: "blocked" });
+    assert.equal(offTg.sent[0].reply_markup, undefined);
+  } finally {
+    let log = "";
+    try {
+      log = readFileSync(join(fx.stateDir, "replies.log"), "utf8");
+    } catch {}
+    for (const [, pid] of log.matchAll(/polling for replies \(pid (\d+)\)/g)) {
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {}
+    }
+    tg.close();
+    offTg.close();
+  }
+});
+
+test("a finished turn's buttons offer the whole response only when it was cut, and a diff only for changes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "send-turn-")); // not a git repo: no changes to show
+  for (const entry of [
+    { text: "Short answer.", env: ["SHOW_CHANGES=0"], expected: ["/screen", "/diff"] },
+    { text: "word ".repeat(100), env: ["LAST_MESSAGE_CHARS=50", "SHOW_CHANGES=1"], expected: ["/full", "/screen"] },
+  ]) {
+    const transcript = join(dir, `${entry.expected.join("")}.jsonl`.replaceAll("/", "-"));
+    writeFileSync(transcript, [
+      { type: "user", timestamp: new Date().toISOString(), message: { role: "user", content: "Answer the question." } },
+      { type: "assistant", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "text", text: entry.text }] } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const agent = { pane_id: "wA:p1", agent: "claude", agent_status: "done", cwd: dir, agent_session: { kind: "path", value: transcript } };
+    const tg = await fakeTelegram();
+    const fx = fixture(["REPLIES=1", "SHOW_LAST_MESSAGE=1", ...entry.env], [agent]);
+    // Stand in for the poller, as above.
+    const release = holdFlock(join(fx.stateDir, "replies.lock"));
+    try {
+      const { out } = await hook(fx, tg.base, "wA:p1");
+      const keyboard = tg.sent[tg.methods.indexOf("sendMessage")]?.reply_markup?.inline_keyboard;
+      assert.deepEqual(keyboard?.map((row) => row.map((b) => b.callback_data)), [entry.expected], out);
+    } finally {
+      release();
+      tg.close();
+    }
+  }
+});

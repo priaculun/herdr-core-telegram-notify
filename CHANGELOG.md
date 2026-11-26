@@ -1,0 +1,373 @@
+# Changelog
+
+## Unreleased
+
+This repository is a fork of
+[`naturalmoods/herdr-telegram-notify`](https://github.com/naturalmoods/herdr-telegram-notify)
+at `f15304d`; the entries below are what this fork adds on top.
+
+- `MUTE_MINUTES` is editable from the chat like any other setting, including the
+  one a bare `/mute` uses. A timer setting above a week is refused rather than
+  handed to `setTimeout`, which clamps it to a millisecond and spins the sweeper.
+- `/set` cannot reach the settings that decide what gets printed or run:
+  `MASK_SECRETS`, `WHISPER_BIN`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`,
+  `CORE_AGENT_KINDS`, `CORE_MACHINES` and `REPLY_ALLOWED_USER_IDS` stay in the
+  file you edit by hand, alongside the token and chat id.
+- A `.env` that is a symlink into a dotfiles repo is written through the link
+  rather than replaced by a regular file, so a dotfile sync cannot revert a
+  setting set from the chat. A setting that cannot be locked is refused with a
+  reason instead of rewritten unserialised.
+- Notification settings are edited from the chat: `/settings` shows what reaches
+  the phone now, `/only blocked` narrows it to one status, `/min done 120` sets a
+  floor, and `/set KEY VALUE` / `/unset KEY` change anything else. Each writes the
+  `.env` in the config dir, so the next event reads it without a restart, and the
+  token and comments in that file are kept. The bot's `/` menu lists them.
+- `BLOCKED_REPEAT_MINUTES` keeps reporting an agent that is still blocked, for
+  as long as it stands there, instead of only at the moment it got stuck. This
+  is the mid-run report: a blocked agent raises no further events, so an agent
+  waiting on a question, or on a provider quota that ran out, was silent after
+  its first message. Each repeat carries how long it has been waiting. Off by
+  default; it starts the sweeper on its own, since there is no event to ride on.
+  `BLOCKED_REMINDER_MINUTES` does the same, having otherwise waited for an event
+  that a blocked pane never sends.
+- Durations are per status. `DONE_MIN_DURATION_SECONDS`,
+  `WORKING_MIN_DURATION_SECONDS`, `IDLE_MIN_DURATION_SECONDS` and
+  `ERROR_MIN_DURATION_SECONDS` override `MIN_DURATION_SECONDS`, so "quiet for
+  short turns, loud for blocked" is a setting rather than a fork.
+  `BLOCKED_MIN_DURATION_SECONDS` is the only way to give a blocked agent a
+  floor, and blocked still inherits none by default: a quota that ran out looks
+  exactly like a long turn.
+- A blocked nudge that Telegram refused is owed again on the next pass, rather
+  than written off as sent. Marking the stretch as nudged before the send meant
+  one failure (a flaky network, a 403) silenced that agent for as long as it
+  stood there, because with `BLOCKED_REPEAT_MINUTES` off nothing else ever owed
+  a message about it. A delivered nudge is recorded once Telegram has taken it.
+- `BLOCKED_IGNORE_QUIET_HOURS` delivers blocked messages during quiet hours
+  (still silently). Off by default.
+- `sweepIntervalMs` in the new `policy.mjs` decides the sweeper interval from
+  both `SWEEP_MINUTES` and `BLOCKED_REPEAT_MINUTES`, floored at 30 seconds; the
+  sweeper now stops only when neither wants a clock.
+- Support the Herdr app, whose agents run in herdr-core (`hc`). herdr-core has
+  no plugin hooks, so `daemon.mjs` follows `hc events` and runs the same
+  notifier; replies go through `hc send`, `/stop` through `hc interrupt`, and
+  `/new` starts a labelled terminal the app adopts as a new tab. Run it as a
+  service on the machine where the agents run. See [docs/core.md](docs/core.md).
+  Herdr TUI is unchanged.
+- Under herdr-core, `/new <workspace>@<branch>` makes the app's checkout under
+  `~/.herdr/worktrees/<repo>/<branch>` and starts the agent there in a new space.
+- Claude Code can report its real session under herdr-core: add
+  [`contrib/claude-session-hook.sh`](contrib/claude-session-hook.sh) to
+  `SessionStart` in `~/.claude/settings.json`, and a `/clear` no longer breaks
+  replies and two Claude agents in one folder keep their own transcript. See
+  [docs/core.md](docs/core.md#claude-code-sessions).
+- The Herdr app shows the same 📨, 📱 and 🔕 badges in a band at the bottom of
+  the window: `contrib/herdr-app/telegram` reads the labels the daemon sets on
+  its terminals. See [docs/core.md](docs/core.md#sidebar).
+- `CORE_MACHINES` lets the daemon notify for agents on machines this core
+  added (`box/t7`) too: notifications, replies, `/stop`, `/screen`, `/diff` and
+  transcripts work as they do locally, and `/new` on one of their spaces is
+  refused for now. Empty by default, as before. Do not include a machine that
+  runs its own daemon on the same bot, or every message comes twice. See
+  [docs/core.md](docs/core.md#where-it-runs).
+- Under herdr-core, pi transcripts are found by the folder pi slugs the cwd
+  into (`~/.pi/agent/sessions`, or `PI_CODING_AGENT_DIR`), so a pi turn has a
+  last message, duration and token count like Claude's and Codex's.
+- herdr-core's `error` status is heard by default: with no `NOTIFY_STATUSES`
+  of your own, `done,blocked,error` notify. A list you write is used exactly
+  as it stands, and the doctor shows the effective one.
+- A parent's notification lists the helpers it started with `hc run` on one
+  line (`🧩 2 helpers: sub-auth done, sub-docs working`) instead of leaving
+  them out entirely.
+
+## 0.13.0
+
+- Notifications carry `/full`, `/screen`, `/diff` and `/stop` as buttons, so
+  you can run them with a tap instead of typing a reply. Each appears only
+  where it is useful: `full` when the response was cut, `diff` unless the tree
+  was clean, `stop` while the agent waits. They need `REPLIES=1`, like the menu
+  buttons, and go when the notification is marked resolved.
+- A reply, button tap or `/stop` that reached the agent is acknowledged with a
+  👍 reaction instead of a `→ sent to wA:p1` message. Voice messages still get
+  their transcript, and a chat that does not allow the reaction gets the text.
+
+## 0.12.1
+
+- Make the README a quick start; move the full reference to [docs/guide.md](docs/guide.md).
+- Add a `sidebar` action to set up separate `$telegram` rows in the local
+  client config, including agent overrides, with a backup and validation.
+  Doctor warns when the local layout is missing the token; remote clients
+  need setup and a menu reload on the machine where their window runs.
+
+## 0.12.0
+
+What Herdr 0.9 offers that the plugin was not using yet.
+
+- `/new <workspace>@<branch> <kind> [prompt]` starts the agent in its own Git
+  worktree on that branch, so work started from the phone does not share a
+  checkout with other agents. The new workspace is checked against the
+  workspace filters before anything is created, and a failed start leaves the
+  checkout in place with instructions to remove it.
+- `$telegram` sidebar tokens show at the desk what the phone knows: `📨 14:32`
+  on a pane with a notification still waiting, `📱 14:32` on one that just got
+  input from the phone, and `🔕 until 15:00` on every workspace while muted,
+  expiring with the mute. Add `$telegram` to your sidebar rows to see them; on
+  by default, `SIDEBAR_TOKENS=0` turns the reporting off.
+- `SHOW_AGENT_TOKENS` adds other plugins' metadata to the notification, such as
+  a quota plugin's model, context use and remaining quota:
+  `📊 Model X · context 37% · 5h 60%`. Off by default.
+- A turn started by a finished background task shows that task's summary on
+  the `▸` line instead of the raw `<task-notification>` markup.
+
+## 0.11.0
+
+More you can do from the phone, and less of it ringing for nothing.
+
+- Reply to a notification with `/stop` to send Esc to its agent while it is
+  working or blocked, without quitting it. The recorded session must still
+  match.
+- Reply with `/screen` to read the same agent session's current screen without
+  sending input. Keeps the bottom of up to 40 cropped lines in one message.
+- Reply with `/diff` to download the same agent session's uncommitted changes
+  as a `.diff` file, with untracked names in the caption. External diff
+  drivers and textconv never run. Diffs over 5 MB get a size and summary
+  instead.
+- Add `/new <workspace> <kind> [prompt]` to start an agent in a new background
+  tab of an existing, unfiltered workspace. Multiline prompts are kept, a
+  failed start closes the tab it opened, and the confirmation can be answered
+  like a notification once the agent's session is known.
+- The bot's commands appear in Telegram's `/` menu once the reply poller
+  starts; nothing needs registering in BotFather. A failure is logged, not
+  fatal.
+- Add `BLOCKED_DELAY_SECONDS` to wait before notifying about a blocked agent,
+  and drop the message if the question was answered at the desk meanwhile.
+  Off (`0`) by default, capped at 120 seconds; the screen and buttons are read
+  after the wait.
+- Mask common secrets (API keys, tokens, Bearer headers, JWTs, private keys,
+  `*_TOKEN=` style assignments) in everything captured for Telegram: last
+  messages, prompts, titles, blocked screens, buttons, `/full`, `/screen` and
+  `/diff`. On by default; `MASK_SECRETS=0` turns this best-effort matching off.
+- Start the configured reply poller and sweeper when Herdr starts, so replies
+  and `/status` no longer wait for an agent status change after a reboot.
+- Handle pane closures: open notifications are marked `✕ pane closed`, the
+  pane's recorded state is forgotten and the board refreshes, without waiting
+  for another event or the sweeper.
+- Read Codex transcripts: the last message, the real prompt (not injected
+  context), task duration, tokens and tools, found by session id under
+  `CODEX_HOME`. Codex records no cost, so none is shown.
+- macOS support with `brew install util-linux` (or `brew install flock`). The
+  plugin finds Homebrew's flock without PATH changes, and CI now runs the tests
+  on macOS too.
+- The reply poller tries a chat answer once more when its connection went
+  stale during a long agent start or transcription, and logs an answer that
+  still fails instead of dropping it silently.
+- Upgrading: a reply poller that is already running keeps the old code and
+  does not know the new commands. Stop it once (`pkill -f replies.mjs`); the
+  next status change or Herdr start brings up the new one.
+
+## 0.10.1
+
+- Add `WHISPER_LANGUAGE` to name the language voice messages are spoken in.
+  Without it whisper guesses per message, and short notes can be transcribed
+  as the wrong language.
+
+## 0.10.0
+
+- Reply with a photo or a file to send it to that agent. The caption and the
+  saved file's path arrive as a new turn. Photos and `jpg`, `png`, `gif`,
+  `webp`, `md`, `txt`, `pdf` and `docx` files up to 20 MB are accepted; files
+  are kept for a day under `files/` in the state directory, owner-only. Blocked
+  agents do not accept files.
+- Reply with a voice message to send its words to that agent. It is
+  transcribed with a local `openai-whisper` or `whisper-ctranslate2` CLI when
+  one is installed (`WHISPER_BIN`, `WHISPER_MODEL`), and the bot says back what
+  it heard. Nothing new is installed; without a whisper CLI, voice messages are
+  refused with a note. `doctor` reports what it found.
+
+## 0.9.0
+
+- Mark notifications the agent has moved past. A blocked notification becomes
+  `✓ answered` or `✓ no longer waiting` and loses its screen; a finished turn
+  becomes `👀 seen at the desk` or `↷ on to the next turn`. On by default;
+  `MARK_RESOLVED=0` leaves the chat as sent.
+- Add `BOARD=1`: one pinned message listing the herd, edited in place on every
+  status change and on each sweep.
+- `/status` shows when each agent entered its state, where the plugin recorded it.
+- Blocked notifications carry one button per option when the screen shows a
+  menu and `REPLIES=1`. A tap goes through the same checks as a typed reply.
+  The reply poller must be restarted to receive taps.
+
+## 0.8.1
+
+- Fix blocked reminders being starved by panes that cannot be nudged. Panes
+  closed while blocked, or in an ignored workspace, no longer use up the three
+  reminders a pass may send.
+- Fall back to the documented 1200 characters when `LAST_MESSAGE_CHARS` is
+  invalid, instead of 600.
+- `doctor` checks the same `git` binary the notifier runs, and no longer
+  counts expired queue entries as waiting.
+- One Telegram client for the notifier, the reply poller and `doctor`, so
+  `doctor` also honours `TELEGRAM_API_BASE`.
+- The reply poller asks for its bot username again if Telegram did not answer
+  at startup, so addressed commands such as `/status@yourbot` start working
+  once the network is back.
+- A `409` from `getUpdates` is logged with its likely cause: another machine
+  or a webhook reading the same bot. The README now recommends one bot per
+  machine with `REPLIES=1`.
+
+## 0.8.0
+
+- Add Telegram `/status` to list agents, workspaces and current states.
+- Add `/mute [minutes]` and `/unmute`, using the same mute state as the Herdr
+  action. Commands use the configured chat and user allowlist.
+- Add `/full` as a reply to a notification to download its saved agent response
+  as a UTF-8 text file. Queued notifications retain their original response.
+- Reload reply permissions after each long poll. Disabling `REPLIES` during a
+  poll prevents the returned messages from being dispatched.
+- Bind blocked replies to the recorded waiting episode and screen. Refuse
+  replies when the question has changed, ended or could not be recorded.
+  Checking and typing are still separate operations; simultaneous terminal
+  input can race with delivery.
+- Keep command responses in the requesting Telegram topic. Reject unexpected
+  command arguments and ignore supported commands addressed to another bot.
+- Restrict saved notification and queue files to owner-only access.
+
+## 0.7.0
+
+One agent, one conversation — and enough locking to mean it.
+
+- `doctor` checks the config strictly instead of only reporting it. Every value
+  it is about to use is parsed with the notifier's own rules — statuses,
+  `QUIET_HOURS`, the counts and sizes, `TELEGRAM_TOPIC_ID`, the
+  `TELEGRAM_TOPICS` pairs, `REPLY_ALLOWED_USER_IDS` and `SWEEP_MINUTES` — and
+  anything unparseable is reported as a problem with what is wrong with it,
+  rather than shown as a setting that is working. Nothing fails at runtime over
+  such a value — a bad number falls back to the default, a bad entry in a list
+  is dropped and the rest of the list goes on — so the setting silently never
+  happens; that is the mistake a doctor exists to find, and the report says
+  which of the two it costs. Exit code `2` now means the config itself,
+  `1` everything else. The token is still never printed.
+- A number in the config has to be a whole number and nothing else: `5min` is
+  read as unset (and reported by `doctor`), where it used to be read as `5`.
+
+- A reply is delivered only to the agent session it was written to. Each
+  notification now records the session that was in the pane, and the poller
+  checks it against what is running there before handing anything over — so a
+  reply written to an agent that has since finished no longer lands in the next
+  agent to take that pane. A missing or changed session is refused with a line
+  saying which, in the chat as well as the log.
+- `REPLY_ALLOWED_USER_IDS` restricts replies to named Telegram user ids. Empty
+  by default, which stays as it was: anyone who can write in the chat, right for
+  a private chat and worth setting for a group. With a list set, senders without
+  a user id of their own — anonymous admins, channel posts — are refused.
+
+- `SWEEP_MINUTES` looks at the queue and the blocked reminders on a timer
+  instead of only on a status change. Off by default — nothing runs in the
+  background until you set it; `5` is a sensible start. A blocked agent raises no further
+  events — it is standing still — so its `BLOCKED_REMINDER_MINUTES` nudge used
+  to wait for some other pane to finish, and the last message an outage queued
+  stayed queued until one did. A separate process, started by the next status
+  change and stopped by its next pass after `SWEEP_MINUTES=0`; `doctor` says
+  whether it is running.
+
+- Several runs at once no longer step on each other. Every hook is its own
+  process and the sweeper and the reply poller are two more, all writing the
+  same state directory: the queue and the message map were read-modify-write, so
+  two of them landing together dropped one of the two messages, and the
+  background processes were started after a check rather than under a lock, so
+  two events arriving at once could start two of each.
+
+  All of it is now held with `flock(1)` — a kernel lock, released by the kernel
+  when the process holding it dies, so there is no leftover lock to detect after
+  a crash and no pid to second-guess. Nothing waits for a lock and then goes
+  ahead without one: a hook that finds a sweep already running leaves the queue
+  to it, and a write that cannot be locked is reported rather than made. One
+  sweeper, one poller, one sweep at a time, however they were started.
+
+  This makes the plugin Linux-only, which the README now says, `doctor` checks
+  and the manifest no longer contradicts — it listed `macos`, which has no
+  `flock(1)` to hold any of this with. Without `flock` the notifications still
+  send; the queue, the message map and the two background processes stop,
+  rather than running unprotected.
+
+## 0.6.0
+
+The other direction.
+
+- `REPLIES=1` makes the notifications answerable: reply to one in Telegram and
+  the text reaches the agent that message was about — typed in and entered for a
+  blocked agent, taken as a new turn by any other. Only your own chat is
+  listened to, and only replies are acted on, so nothing in the chat can pick a
+  pane for itself.
+
+- `SHOW_TOOLS` counts pi's tool calls. pi writes `toolCall` blocks where Claude
+  writes `tool_use`, and only Claude's spelling was recognised, so every pi turn
+  reported no tools rather than reporting none.
+
+## 0.5.1
+
+- The blocked-screen block is cropped to one column when the pane is split. An
+  agent with a diff panel beside it put a piece of both in every terminal row,
+  and collapsing the whitespace out of those rows welded them into a paragraph
+  that read as neither.
+
+## 0.5.0
+
+What the message says, and being able to find out why it did not arrive.
+
+- The `▸` line: the prompt the turn was answering, which the session title —
+  written once and left there — usually is not.
+- The `✎` line: files touched, lines added and removed, files still untracked.
+  It separates an agent that changed things from one that thought about it.
+- `SHOW_TOOLS` (off by default) adds the tools the turn reached for.
+- A last message past a few lines is sent as a collapsed quote, so
+  `LAST_MESSAGE_CHARS` goes from 600 to 1200 without filling the chat.
+- Sub-cent costs report as `$0.004` rather than `$0.00`.
+- A `doctor` action checks Node, herdr, git, the config file and its
+  permissions, the state directory and the bot credentials, then sends one
+  silent test message.
+- `DEBUG=1` explains a run that decided not to send, and a `.env` key the plugin
+  does not read is named — with the nearest real key when it looks like a typo.
+- An unexpected failure is reported as one redacted line instead of a raw stack.
+- The transcript is read four megabytes and fifteen hundred records back rather
+  than 512 KiB and two hundred: a long turn was losing its prompt, its duration
+  and part of its token count.
+- `lib.mjs` holds everything with no side effects on import, and `node --test
+  test/lib.test.mjs` covers it. CI runs on Node 18 through 24.
+
+## 0.4.0
+
+Delivery that survives a flaky network, and the controls to keep the volume
+worth reading.
+
+- A send gets eight seconds and three attempts, backing off, honouring
+  Telegram's `retry_after`. A rejected token or chat id is not retried.
+- What still fails is queued and delivered on the next status change on any
+  pane, marked with how late it is. Twenty messages, six hours.
+- A long message is fitted by shortening the body and rendering again, so the
+  markup always arrives whole; it used to be cut mid-tag and rejected.
+- `MIN_DURATION_SECONDS` drops short turns; `blocked` is exempt.
+- `QUIET_HOURS` delivers without a sound.
+- `NOTIFY_WORKSPACES` / `IGNORE_WORKSPACES` decide which work may reach the
+  phone; `TELEGRAM_TOPICS` gives each workspace its own forum topic.
+- A `mute` action silences it for `MUTE_MINUTES`, and lifts the mute when it is
+  already on.
+- `BLOCKED_REMINDER_MINUTES` nudges once about an agent still waiting.
+- The bot token is redacted from anything that reaches a log.
+
+## 0.3.0
+
+Four bugs, each of which made the plugin wrong rather than quiet.
+
+- The working clock is cleared when the work stops. It used to be carried
+  forward, so a `done` → `idle` → `done` flap, or a pane left working overnight,
+  reported "ran 14h" for a turn of seconds.
+- One agent session reported on two panes sends one message, not two.
+- A `.env` other users can read is called out, with the chmod that fixes it.
+- State files for panes gone a week are swept, along with what earlier versions
+  left behind.
+
+## 0.2.1 and earlier
+
+The message grew from a status line into the session title, project, branch,
+duration, tokens, herd and the agent's last message; `run.sh` learned to find
+Node the way other people's machines have it.
